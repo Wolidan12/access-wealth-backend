@@ -1,15 +1,10 @@
-const express = require('express');
-const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
-
-const app = express();
-
-// 1. THE ULTIMATE SECURITY BYPASS
-app.use(cors({ 
-    origin: '*', 
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+app.use(cors({
+  origin: [
+    'https://accesswealthhq.com',
+    'https://www.accesswealthhq.com'
+  ],
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  credentials: true
 }));
 app.use(express.json());
 
