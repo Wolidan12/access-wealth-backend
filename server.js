@@ -91,7 +91,6 @@ const db = new sqlite3.Database(dbPath, (err) => {
     } else {
         console.log(`✅ DATABASE CONNECTED! (Path: ${dbPath})`);
         
-        // Ensure busy threads wait up to 10 seconds before throwing SQLITE_BUSY
         db.configure('busyTimeout', 10000);
         
         db.run("PRAGMA journal_mode=WAL;", (pragmaErr) => {
@@ -234,9 +233,12 @@ app.post('/api/register', authLimiter, async (req, res) => {
         const { username, password, referred_by } = req.body;
 
         if (!username || !password) return res.status(400).json({ error: "Username and password required" });
-        if (!/^[a-zA-Z0-9_]{3,20}$/.test(username)) {
-            return res.status(400).json({ error: "Username must be 3-20 characters long and contain only letters, numbers, and underscores." });
+        
+        // FIXED: Allows letters, numbers, underscores, dots, @, and hyphens for email support
+        if (!/^[a-zA-Z0-9_.@-]{3,50}$/.test(username)) {
+            return res.status(400).json({ error: "Username/Email contains invalid characters or is too short." });
         }
+        
         if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
 
         if (referred_by) {
@@ -263,18 +265,39 @@ async function processRegistration(username, password, referred_by, res, attempt
         db.run(`INSERT INTO users (username, password, my_referral_id, referred_by, role) VALUES (?, ?, ?, ?, 'user')`, 
             [username, hashedPassword, my_referral_id, referred_by], function(err) {
                 if (err) {
-                    // Collision retry loop
                     if (err.message.includes("UNIQUE constraint failed: users.my_referral_id")) {
                         if (attempt < 3) return processRegistration(username, password, referred_by, res, attempt + 1);
                         return res.status(500).json({ error: "Failed to generate unique referral code." });
                     }
                     if (err.message.includes("UNIQUE constraint failed: users.username")) {
-                        return res.status(400).json({ error: "Username is already taken" });
+                        return res.status(400).json({ error: "Username or Email is already taken" });
                     }
                     console.error("SQLite Insert Error:", err.message);
                     return res.status(500).json({ error: "Database error during user creation" });
                 }
-                res.json({ success: true, message: "Registration successful!" });
+                
+                // FIXED: Auto-Login immediately after registration
+                const token = jwt.sign(
+                    { id: this.lastID, username: username, role: 'user' },
+                    process.env.JWT_SECRET,
+                    { 
+                        expiresIn: '7d',
+                        issuer: 'AccessWealthHQ',
+                        audience: 'AccessWealthUsers'
+                    }
+                );
+
+                res.json({ 
+                    success: true, 
+                    message: "Registration successful!",
+                    token,
+                    user: {
+                        id: this.lastID,
+                        username: username,
+                        role: 'user',
+                        planActivated: 'false'
+                    }
+                });
         });
     } catch (hashError) {
         res.status(500).json({ error: "Failed to process security credentials" });
@@ -662,12 +685,11 @@ function verifyPremiumAccess(username, cost, res, callback) {
         if (user.planActivated !== 'true') return res.status(403).json({ error: "Premium Feature Locked." }); 
         if (user.balance < cost) return res.status(400).json({ error: "Insufficient balance." }); 
         
-        // Atomic deduction check instead of calculating in memory
         db.run(`UPDATE users SET balance = balance - ? WHERE LOWER(username) = LOWER(?) AND balance >= ?`, [cost, username, cost], function(updateErr) {
             if (updateErr) return res.status(500).json({ error: "Database error." });
             if (this.changes === 0) return res.status(400).json({ error: "Insufficient balance or user not found." });
             
-            callback(user.balance - cost); // Execution proceeds if atomic deduction passes
+            callback(user.balance - cost); 
         });
     }); 
 }
