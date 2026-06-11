@@ -10,6 +10,8 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 
+const app = express();
+
 // ==========================================
 // ENVIRONMENT VARIABLE VALIDATION
 // ==========================================
@@ -18,17 +20,21 @@ if (!process.env.JWT_SECRET || !process.env.PAYSTACK_SECRET_KEY) {
     process.exit(1);
 }
 
-const app = express();
+// ==========================================
+// SECURITY & MIDDLEWARE (Fixed for Railway)
+// ==========================================
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
 
+// CORS configured to explicitly allow your frontend domains
 app.use(cors({  
   origin: [
     'https://accesswealthhq.com',
     'https://www.accesswealthhq.com',
     'http://localhost:3000'
   ],
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-paystack-signature'],
   credentials: true
 }));
 
@@ -234,7 +240,6 @@ app.post('/api/register', authLimiter, async (req, res) => {
 
         if (!username || !password) return res.status(400).json({ error: "Username and password required" });
         
-        // FIXED: Allows letters, numbers, underscores, dots, @, and hyphens for email support
         if (!/^[a-zA-Z0-9_.@-]{3,50}$/.test(username)) {
             return res.status(400).json({ error: "Username/Email contains invalid characters or is too short." });
         }
@@ -276,7 +281,6 @@ async function processRegistration(username, password, referred_by, res, attempt
                     return res.status(500).json({ error: "Database error during user creation" });
                 }
                 
-                // FIXED: Auto-Login immediately after registration
                 const token = jwt.sign(
                     { id: this.lastID, username: username, role: 'user' },
                     process.env.JWT_SECRET,
@@ -743,6 +747,9 @@ process.on('SIGTERM', () => {
     });
 });
 
+// ==========================================
+// SERVER STARTUP
+// ==========================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Master Server running on port ${PORT}`);
