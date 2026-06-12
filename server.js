@@ -12,17 +12,11 @@ const helmet = require('helmet');
 
 const app = express();
 
-// ==========================================
-// ENVIRONMENT VARIABLE VALIDATION
-// ==========================================
 if (!process.env.JWT_SECRET || !process.env.PAYSTACK_SECRET_KEY) {
     console.error("FATAL ERROR: JWT_SECRET or PAYSTACK_SECRET_KEY is missing.");
     process.exit(1);
 }
 
-// ==========================================
-// SECURITY & MIDDLEWARE
-// ==========================================
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
 
@@ -49,15 +43,11 @@ app.use(express.json({
 }));
 
 app.use(express.static(__dirname));
-
 app.use((req, res, next) => {
     console.log(`[RADAR] ${req.method} request at: ${req.url}`);
     next();
 });
 
-// ==========================================
-// VALIDATION HELPERS
-// ==========================================
 function isValidAmount(val) {
     const num = parseFloat(val);
     return typeof num === 'number' && !isNaN(num) && isFinite(num) && num > 0;
@@ -67,9 +57,6 @@ function isValidEmail(email) {
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
-// ==========================================
-// RATE LIMITERS
-// ==========================================
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 15,
@@ -108,9 +95,7 @@ const db = new sqlite3.Database(dbPath, (err) => {
     }
 });
 
-// Migration: ensure all required columns exist
 db.serialize(() => {
-    // Create table if not exists (full schema)
     db.run(`CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE,
@@ -127,7 +112,6 @@ db.serialize(() => {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // Add missing columns if they don't exist
     const columnsToAdd = [
         { name: 'balance', type: 'REAL DEFAULT 0' },
         { name: 'taskEarnings', type: 'REAL DEFAULT 0' },
@@ -151,7 +135,6 @@ db.serialize(() => {
         });
     });
 
-    // Other tables
     db.run(`CREATE TABLE IF NOT EXISTS deposits (
         id INTEGER PRIMARY KEY AUTOINCREMENT, 
         username TEXT, 
@@ -216,7 +199,6 @@ db.serialize(() => {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // Insert default admin & support accounts after migration (small delay)
     setTimeout(() => {
         db.get(`SELECT id FROM users WHERE role = 'admin' LIMIT 1`, (err, row) => {
             if (err) console.error("Admin check error:", err.message);
@@ -250,9 +232,6 @@ db.serialize(() => {
     }, 500);
 });
 
-// ==========================================
-// JWT AUTHENTICATION MIDDLEWARE
-// ==========================================
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -295,9 +274,6 @@ app.post('/api/user/sync', authenticateToken, (req, res) => {
     });
 });
 
-// ==========================================
-// REGISTRATION (Fixed)
-// ==========================================
 app.post('/api/register', authLimiter, async (req, res) => {
     try {
         const { username, password, referred_by } = req.body;
@@ -328,7 +304,18 @@ app.post('/api/register', authLimiter, async (req, res) => {
                         return res.status(500).json({ error: "Database error: " + err.message });
                     }
                     const token = jwt.sign({ id: this.lastID, username, role: 'user' }, process.env.JWT_SECRET, { expiresIn: '7d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
-                    res.json({ success: true, message: "Registration successful!", token, user: { id: this.lastID, username, role: 'user', planActivated: 'false' } });
+                    res.json({
+                        success: true,
+                        message: "Registration successful!",
+                        token,
+                        user: {
+                            id: this.lastID,
+                            username,
+                            role: 'user',
+                            planActivated: 'false',
+                            my_referral_id: my_referral_id
+                        }
+                    });
                 });
         });
     } catch (error) {
@@ -337,19 +324,27 @@ app.post('/api/register', authLimiter, async (req, res) => {
     }
 });
 
-// ==========================================
-// LOGIN
-// ==========================================
 app.post('/api/login', authLimiter, async (req, res) => {
     try {
         const { username, password } = req.body;
         if (!username || !password) return res.status(400).json({ error: "Username and password required" });
-        db.get(`SELECT id, username, password, role, planActivated, activePackage FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
+        db.get(`SELECT id, username, password, role, planActivated, activePackage, my_referral_id FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
             if (err || !user) return res.status(400).json({ error: "Invalid username or password" });
             const passwordMatch = await bcryptjs.compare(password, user.password);
             if (!passwordMatch) return res.status(400).json({ error: "Invalid username or password" });
             const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, process.env.JWT_SECRET, { expiresIn: '7d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
-            res.json({ success: true, token, user: { id: user.id, username: user.username, role: user.role, planActivated: user.planActivated, activePackage: user.activePackage } });
+            res.json({
+                success: true,
+                token,
+                user: {
+                    id: user.id,
+                    username: user.username,
+                    role: user.role,
+                    planActivated: user.planActivated,
+                    activePackage: user.activePackage,
+                    my_referral_id: user.my_referral_id
+                }
+            });
         });
     } catch (error) {
         res.status(500).json({ error: "Login failed" });
@@ -621,6 +616,28 @@ app.get('/api/admin/stats', authenticateToken, adminOnly, (req, res) => {
     });
 });
 
+// ==========================================
+// 7. REFERRAL SYSTEM ENDPOINTS
+// ==========================================
+app.get('/api/referral/stats/:username', authenticateToken, (req, res) => {
+    const username = req.params.username;
+    db.get(`SELECT my_referral_id FROM users WHERE LOWER(username) = LOWER(?)`, [username], (err, user) => {
+        if (err || !user) return res.status(404).json({ error: "User not found" });
+        const myRefId = user.my_referral_id;
+        db.get(`SELECT COUNT(*) as count, COALESCE(SUM(affiliate_balance), 0) as earnings FROM users WHERE referred_by = ?`, [myRefId], (err2, stats) => {
+            if (err2) return res.status(500).json({ error: "Database error" });
+            res.json({ success: true, totalReferrals: stats.count || 0, earnings: stats.earnings || 0 });
+        });
+    });
+});
+
+app.get('/api/referral/leaderboard', (req, res) => {
+    db.all(`SELECT username, affiliate_balance as total_earned, (SELECT COUNT(*) FROM users WHERE referred_by = u.my_referral_id) as referral_count FROM users u WHERE role = 'user' ORDER BY affiliate_balance DESC LIMIT 10`, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: "Database error" });
+        res.json({ success: true, leaderboard: rows || [] });
+    });
+});
+
 // Premium feature helper (ads, bills, sms)
 function verifyPremiumAccess(username, cost, res, callback) {
     if (!isValidAmount(cost)) return res.status(400).json({ error: "Invalid amount." });
@@ -669,7 +686,7 @@ app.post('/api/sms/send', authenticateToken, actionLimiter, (req, res) => {
 });
 
 // ==========================================
-// DEBUG ROUTES (optional – remove after testing)
+// DEBUG ROUTES (optional)
 // ==========================================
 app.get('/debug/ensure-admin', async (req, res) => {
     try {
@@ -686,7 +703,7 @@ app.get('/debug/ensure-admin', async (req, res) => {
 });
 
 app.get('/debug/check-users', (req, res) => {
-    db.all(`SELECT username, role FROM users`, [], (err, rows) => {
+    db.all(`SELECT username, role, my_referral_id FROM users`, [], (err, rows) => {
         if (err) res.json({ error: err.message });
         else res.json({ users: rows });
     });
