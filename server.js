@@ -89,7 +89,7 @@ const webhookLimiter = rateLimit({
 });
 
 // ==========================================
-// DATABASE INITIALIZATION
+// DATABASE INITIALIZATION WITH MIGRATION
 // ==========================================
 const dbPath = process.env.RAILWAY_VOLUME_MOUNT_PATH
     ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'database.sqlite')
@@ -108,22 +108,50 @@ const db = new sqlite3.Database(dbPath, (err) => {
     }
 });
 
+// Migration: ensure all required columns exist
 db.serialize(() => {
+    // Create table if not exists (full schema)
     db.run(`CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, 
-        username TEXT UNIQUE, 
-        password TEXT, 
-        balance REAL DEFAULT 0, 
-        taskEarnings REAL DEFAULT 0, 
-        daily_earnings REAL DEFAULT 0, 
-        affiliate_balance REAL DEFAULT 0, 
-        my_referral_id TEXT UNIQUE, 
-        referred_by TEXT, 
-        planActivated TEXT DEFAULT 'false', 
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        password TEXT,
+        balance REAL DEFAULT 0,
+        taskEarnings REAL DEFAULT 0,
+        daily_earnings REAL DEFAULT 0,
+        affiliate_balance REAL DEFAULT 0,
+        my_referral_id TEXT UNIQUE,
+        referred_by TEXT,
+        planActivated TEXT DEFAULT 'false',
         activePackage TEXT DEFAULT 'None',
         role TEXT DEFAULT 'user',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
+
+    // Add missing columns if they don't exist
+    const columnsToAdd = [
+        { name: 'balance', type: 'REAL DEFAULT 0' },
+        { name: 'taskEarnings', type: 'REAL DEFAULT 0' },
+        { name: 'daily_earnings', type: 'REAL DEFAULT 0' },
+        { name: 'affiliate_balance', type: 'REAL DEFAULT 0' },
+        { name: 'my_referral_id', type: 'TEXT UNIQUE' },
+        { name: 'referred_by', type: 'TEXT' },
+        { name: 'planActivated', type: 'TEXT DEFAULT \'false\'' },
+        { name: 'activePackage', type: 'TEXT DEFAULT \'None\'' },
+        { name: 'role', type: 'TEXT DEFAULT \'user\'' },
+        { name: 'created_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' }
+    ];
+
+    columnsToAdd.forEach(col => {
+        db.run(`ALTER TABLE users ADD COLUMN ${col.name} ${col.type}`, (err) => {
+            if (err && !err.message.includes('duplicate column name')) {
+                console.warn(`Warning adding column ${col.name}:`, err.message);
+            } else if (!err) {
+                console.log(`✅ Column ${col.name} added (if missing).`);
+            }
+        });
+    });
+
+    // Other tables
     db.run(`CREATE TABLE IF NOT EXISTS deposits (
         id INTEGER PRIMARY KEY AUTOINCREMENT, 
         username TEXT, 
@@ -188,37 +216,38 @@ db.serialize(() => {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // Auto-create admin & support accounts if they don't exist (with error handling)
-    db.get(`SELECT id FROM users WHERE role = 'admin' LIMIT 1`, (err, row) => {
-        if (err) console.error("Admin check error:", err.message);
-        if (!row) {
-            const adminHash = bcryptjs.hashSync('Admin@234', 10);
-            db.run(`INSERT OR IGNORE INTO users (username, password, role, my_referral_id, planActivated, activePackage)
-                    VALUES (?, ?, 'admin', 'ADMIN123', 'true', 'Wealth VIP')`,
-                    ['admin@accesswealth.com', adminHash], function(insertErr) {
-                if (insertErr) console.error("Failed to create admin:", insertErr.message);
-                else if (this.changes) console.log("✅ Admin account created: admin@accesswealth.com / Admin@234");
-                else console.log("Admin account already exists.");
-            });
-        } else {
-            console.log("Admin account already exists.");
-        }
-    });
-    db.get(`SELECT id FROM users WHERE role = 'support' LIMIT 1`, (err, row) => {
-        if (err) console.error("Support check error:", err.message);
-        if (!row) {
-            const supportHash = bcryptjs.hashSync('Support@234', 10);
-            db.run(`INSERT OR IGNORE INTO users (username, password, role, my_referral_id, planActivated, activePackage)
-                    VALUES (?, ?, 'support', 'SUPPORT123', 'true', 'Wealth VIP')`,
-                    ['support@accesswealth.com', supportHash], function(insertErr) {
-                if (insertErr) console.error("Failed to create support:", insertErr.message);
-                else if (this.changes) console.log("✅ Support account created: support@accesswealth.com / Support@234");
-                else console.log("Support account already exists.");
-            });
-        } else {
-            console.log("Support account already exists.");
-        }
-    });
+    // Insert default admin & support accounts after migration (small delay)
+    setTimeout(() => {
+        db.get(`SELECT id FROM users WHERE role = 'admin' LIMIT 1`, (err, row) => {
+            if (err) console.error("Admin check error:", err.message);
+            if (!row) {
+                const adminHash = bcryptjs.hashSync('Admin@234', 10);
+                db.run(`INSERT OR IGNORE INTO users (username, password, role, my_referral_id, planActivated, activePackage)
+                        VALUES (?, ?, 'admin', 'ADMIN123', 'true', 'Wealth VIP')`,
+                        ['admin@accesswealth.com', adminHash], function(insertErr) {
+                    if (insertErr) console.error("Failed to create admin:", insertErr.message);
+                    else if (this.changes) console.log("✅ Admin account created: admin@accesswealth.com / Admin@234");
+                });
+            } else {
+                console.log("Admin account already exists.");
+            }
+        });
+
+        db.get(`SELECT id FROM users WHERE role = 'support' LIMIT 1`, (err, row) => {
+            if (err) console.error("Support check error:", err.message);
+            if (!row) {
+                const supportHash = bcryptjs.hashSync('Support@234', 10);
+                db.run(`INSERT OR IGNORE INTO users (username, password, role, my_referral_id, planActivated, activePackage)
+                        VALUES (?, ?, 'support', 'SUPPORT123', 'true', 'Wealth VIP')`,
+                        ['support@accesswealth.com', supportHash], function(insertErr) {
+                    if (insertErr) console.error("Failed to create support:", insertErr.message);
+                    else if (this.changes) console.log("✅ Support account created: support@accesswealth.com / Support@234");
+                });
+            } else {
+                console.log("Support account already exists.");
+            }
+        });
+    }, 500);
 });
 
 // ==========================================
@@ -267,17 +296,15 @@ app.post('/api/user/sync', authenticateToken, (req, res) => {
 });
 
 // ==========================================
-// IMPROVED REGISTRATION (with better error handling)
+// REGISTRATION (Fixed)
 // ==========================================
 app.post('/api/register', authLimiter, async (req, res) => {
     try {
         const { username, password, referred_by } = req.body;
-
         if (!username || !password) return res.status(400).json({ error: "Username and password required" });
         if (!/^[a-zA-Z0-9_.@-]{3,50}$/.test(username)) return res.status(400).json({ error: "Invalid username/email format" });
         if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
 
-        // Check if username already exists
         db.get(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, existing) => {
             if (err) {
                 console.error("DB error on username check:", err.message);
@@ -298,7 +325,7 @@ app.post('/api/register', authLimiter, async (req, res) => {
                         if (err.message.includes("UNIQUE constraint failed: users.my_referral_id")) {
                             return res.status(500).json({ error: "System error: please try again." });
                         }
-                        return res.status(500).json({ error: "Database error during registration. Please try again." });
+                        return res.status(500).json({ error: "Database error: " + err.message });
                     }
                     const token = jwt.sign({ id: this.lastID, username, role: 'user' }, process.env.JWT_SECRET, { expiresIn: '7d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
                     res.json({ success: true, message: "Registration successful!", token, user: { id: this.lastID, username, role: 'user', planActivated: 'false' } });
@@ -311,7 +338,7 @@ app.post('/api/register', authLimiter, async (req, res) => {
 });
 
 // ==========================================
-// LOGIN (unchanged)
+// LOGIN
 // ==========================================
 app.post('/api/login', authLimiter, async (req, res) => {
     try {
@@ -330,7 +357,7 @@ app.post('/api/login', authLimiter, async (req, res) => {
 });
 
 // ==========================================
-// 2. PAYSTACK AUTOMATED DEPOSITS (keep as is)
+// 2. PAYSTACK AUTOMATED DEPOSITS
 // ==========================================
 app.post('/api/paystack/initialize', authenticateToken, actionLimiter, async (req, res) => {
     try {
@@ -642,7 +669,7 @@ app.post('/api/sms/send', authenticateToken, actionLimiter, (req, res) => {
 });
 
 // ==========================================
-// DEBUG ROUTES (temporary – remove after testing)
+// DEBUG ROUTES (optional – remove after testing)
 // ==========================================
 app.get('/debug/ensure-admin', async (req, res) => {
     try {
