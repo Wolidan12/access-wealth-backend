@@ -135,6 +135,24 @@ db.serialize(() => {
         });
     });
 
+    // ✅ NEW: Add profile and bank columns (if missing)
+    const profileColumns = [
+        { name: 'full_name', type: 'TEXT' },
+        { name: 'phone', type: 'TEXT' },
+        { name: 'bank_name', type: 'TEXT' },
+        { name: 'bank_account_number', type: 'TEXT' },
+        { name: 'bank_account_holder', type: 'TEXT' }
+    ];
+    profileColumns.forEach(col => {
+        db.run(`ALTER TABLE users ADD COLUMN ${col.name} ${col.type}`, (err) => {
+            if (err && !err.message.includes('duplicate column name')) {
+                console.warn(`Warning adding column ${col.name}:`, err.message);
+            } else if (!err) {
+                console.log(`✅ Column ${col.name} added (if missing).`);
+            }
+        });
+    });
+
     db.run(`CREATE TABLE IF NOT EXISTS deposits (
         id INTEGER PRIMARY KEY AUTOINCREMENT, 
         username TEXT, 
@@ -636,6 +654,85 @@ app.get('/api/referral/leaderboard', (req, res) => {
         if (err) return res.status(500).json({ error: "Database error" });
         res.json({ success: true, leaderboard: rows || [] });
     });
+});
+
+// ==========================================
+// 8. USER PROFILE & BANK DETAILS (NEW)
+// ==========================================
+
+// Get user profile (including full_name, phone, bank fields)
+app.get('/api/user/profile/:username', authenticateToken, (req, res) => {
+    if (req.user.username !== req.params.username && req.user.role !== 'admin') {
+        return res.status(403).json({ error: "Unauthorized" });
+    }
+    db.get(`SELECT full_name, phone, bank_name, bank_account_number, bank_account_holder FROM users WHERE LOWER(username) = LOWER(?)`,
+        [req.params.username], (err, profile) => {
+            if (err) return res.status(500).json({ error: "Database error" });
+            res.json({ success: true, profile: profile || {} });
+        });
+});
+
+// Update profile (full_name, phone)
+app.post('/api/user/update-profile', authenticateToken, async (req, res) => {
+    try {
+        const { full_name, phone } = req.body;
+        const username = req.user.username;
+
+        db.run(`UPDATE users SET full_name = ?, phone = ? WHERE LOWER(username) = LOWER(?)`,
+            [full_name || null, phone || null, username], function(err) {
+                if (err) return res.status(500).json({ error: "Database error" });
+                res.json({ success: true, message: "Profile updated successfully" });
+            });
+    } catch (error) {
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
+// Update bank details
+app.post('/api/user/update-bank', authenticateToken, async (req, res) => {
+    try {
+        const { bank_name, account_number, account_holder } = req.body;
+        const username = req.user.username;
+
+        if (!bank_name || !account_number || !account_holder) {
+            return res.status(400).json({ error: "All bank fields are required" });
+        }
+
+        db.run(`UPDATE users SET bank_name = ?, bank_account_number = ?, bank_account_holder = ? WHERE LOWER(username) = LOWER(?)`,
+            [bank_name, account_number, account_holder, username], function(err) {
+                if (err) return res.status(500).json({ error: "Database error" });
+                res.json({ success: true, message: "Bank details saved successfully" });
+            });
+    } catch (error) {
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
+// Change password (requires current password)
+app.post('/api/user/change-password', authenticateToken, async (req, res) => {
+    try {
+        const { current_password, new_password } = req.body;
+        const username = req.user.username;
+
+        if (!current_password || !new_password || new_password.length < 6) {
+            return res.status(400).json({ error: "Current password and new password (min 6 chars) required" });
+        }
+
+        db.get(`SELECT password FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
+            if (err || !user) return res.status(404).json({ error: "User not found" });
+
+            const valid = await bcryptjs.compare(current_password, user.password);
+            if (!valid) return res.status(401).json({ error: "Current password is incorrect" });
+
+            const hashed = await bcryptjs.hash(new_password, 10);
+            db.run(`UPDATE users SET password = ? WHERE LOWER(username) = LOWER(?)`, [hashed, username], function(updateErr) {
+                if (updateErr) return res.status(500).json({ error: "Database error" });
+                res.json({ success: true, message: "Password changed successfully" });
+            });
+        });
+    } catch (error) {
+        res.status(500).json({ error: "Server error" });
+    }
 });
 
 // Premium feature helper (ads, bills, sms)
