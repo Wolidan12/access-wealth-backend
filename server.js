@@ -686,7 +686,7 @@ app.post('/api/sms/send', authenticateToken, actionLimiter, (req, res) => {
 });
 
 // ==========================================
-// DEBUG ROUTES (optional)
+// DEBUG ROUTES (REMOVE AFTER USE)
 // ==========================================
 app.get('/debug/ensure-admin', async (req, res) => {
     try {
@@ -706,6 +706,19 @@ app.get('/debug/check-users', (req, res) => {
     db.all(`SELECT username, role, my_referral_id FROM users`, [], (err, rows) => {
         if (err) res.json({ error: err.message });
         else res.json({ users: rows });
+    });
+});
+
+// ==========================================
+// 🔧 FIX MISSING REFERRAL IDs (RUN THIS ONCE)
+// ==========================================
+app.get('/debug/fix-referral-ids', (req, res) => {
+    db.run(`UPDATE users SET my_referral_id = 'AW' || upper(hex(randomblob(4))) WHERE my_referral_id IS NULL OR my_referral_id = ''`, function(err) {
+        if (err) {
+            console.error("Fix error:", err.message);
+            return res.json({ error: err.message });
+        }
+        res.json({ success: true, updated: this.changes });
     });
 });
 
