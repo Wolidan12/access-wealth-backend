@@ -695,13 +695,24 @@ app.get('/api/support/users', authenticateToken, adminOnly, (req, res) => {
     });
 });
 
+// ✅ NEW: Get all users for support agent (no sensitive data)
+app.get('/api/support/all-users', authenticateToken, (req, res) => {
+    // Allow both admin and support roles
+    if (req.user.role !== 'admin' && req.user.role !== 'support') {
+        return res.status(403).json({ error: "Access denied" });
+    }
+    db.all(`SELECT username, created_at FROM users ORDER BY created_at DESC`, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: "Database error" });
+        res.json({ success: true, users: rows || [] });
+    });
+});
+
 // ✅ NEW: Auto send welcome message when user first opens chat
 app.post('/api/chat/welcome', authenticateToken, async (req, res) => {
     try {
         const username = req.user.username;
         const welcomeMessage = "👋 Hello! I'm an Access Wealth support agent. How may I help you today?";
         
-        // Check if user already has any messages
         db.get(`SELECT id FROM messages WHERE user_id = ? LIMIT 1`, [username], (err, existing) => {
             if (err) return res.status(500).json({ error: "Database error" });
             
