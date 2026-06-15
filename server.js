@@ -669,7 +669,8 @@ app.post('/api/claim-daily-task', authenticateToken, async (req, res) => {
 // 7. LIVE CHAT / CUSTOMER SUPPORT API
 // ==========================================
 app.get('/api/chat/history/:username', authenticateToken, (req, res) => {
-    if (req.user.role !== 'admin' && req.user.username.toLowerCase() !== req.params.username.toLowerCase()) {
+    // ✅ FIX: Allow admin, support agent, or the user themselves
+    if (req.user.role !== 'admin' && req.user.role !== 'support' && req.user.username.toLowerCase() !== req.params.username.toLowerCase()) {
         return res.status(403).json({ error: "Unauthorized access" });
     }
     db.all(`SELECT * FROM messages WHERE user_id = ? ORDER BY id ASC`, [req.params.username], (err, rows) => {
@@ -697,7 +698,6 @@ app.get('/api/support/users', authenticateToken, adminOnly, (req, res) => {
 
 // ✅ NEW: Get all users for support agent (no sensitive data)
 app.get('/api/support/all-users', authenticateToken, (req, res) => {
-    // Allow both admin and support roles
     if (req.user.role !== 'admin' && req.user.role !== 'support') {
         return res.status(403).json({ error: "Access denied" });
     }
