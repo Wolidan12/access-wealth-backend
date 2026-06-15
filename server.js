@@ -109,6 +109,11 @@ db.serialize(() => {
         planActivated TEXT DEFAULT 'false',
         activePackage TEXT DEFAULT 'None',
         role TEXT DEFAULT 'user',
+        full_name TEXT,
+        phone TEXT,
+        bank_name TEXT,
+        bank_account_number TEXT,
+        bank_account_holder TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
@@ -122,6 +127,11 @@ db.serialize(() => {
         { name: 'planActivated', type: 'TEXT DEFAULT \'false\'' },
         { name: 'activePackage', type: 'TEXT DEFAULT \'None\'' },
         { name: 'role', type: 'TEXT DEFAULT \'user\'' },
+        { name: 'full_name', type: 'TEXT' },
+        { name: 'phone', type: 'TEXT' },
+        { name: 'bank_name', type: 'TEXT' },
+        { name: 'bank_account_number', type: 'TEXT' },
+        { name: 'bank_account_holder', type: 'TEXT' },
         { name: 'created_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' }
     ];
 
@@ -135,29 +145,14 @@ db.serialize(() => {
         });
     });
 
-    // ✅ NEW: Add profile and bank columns (if missing)
-    const profileColumns = [
-        { name: 'full_name', type: 'TEXT' },
-        { name: 'phone', type: 'TEXT' },
-        { name: 'bank_name', type: 'TEXT' },
-        { name: 'bank_account_number', type: 'TEXT' },
-        { name: 'bank_account_holder', type: 'TEXT' }
-    ];
-    profileColumns.forEach(col => {
-        db.run(`ALTER TABLE users ADD COLUMN ${col.name} ${col.type}`, (err) => {
-            if (err && !err.message.includes('duplicate column name')) {
-                console.warn(`Warning adding column ${col.name}:`, err.message);
-            } else if (!err) {
-                console.log(`✅ Column ${col.name} added (if missing).`);
-            }
-        });
-    });
-
+    // Existing tables
     db.run(`CREATE TABLE IF NOT EXISTS deposits (
         id INTEGER PRIMARY KEY AUTOINCREMENT, 
         username TEXT, 
         amount REAL, 
         sender_name TEXT, 
+        payment_method TEXT,
+        transaction_ref TEXT,
         status TEXT DEFAULT 'pending', 
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
@@ -176,7 +171,8 @@ db.serialize(() => {
         amount REAL, 
         fee REAL,
         total_deducted REAL,
-        wallet_type TEXT, 
+        wallet_type TEXT,
+        bank_details TEXT,
         status TEXT DEFAULT 'pending', 
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
@@ -217,6 +213,37 @@ db.serialize(() => {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
+    // ✅ NEW TABLES
+    db.run(`CREATE TABLE IF NOT EXISTS daily_claims (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT,
+        claim_date TEXT,
+        amount REAL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    db.run(`CREATE TABLE IF NOT EXISTS broadcasts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        message TEXT,
+        created_by TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    db.run(`CREATE TABLE IF NOT EXISTS sponsored_posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        description TEXT,
+        reward_amount REAL,
+        required_plan TEXT,
+        image_url TEXT,
+        link TEXT,
+        status TEXT DEFAULT 'active',
+        created_by TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    // Admin and support accounts
     setTimeout(() => {
         db.get(`SELECT id FROM users WHERE role = 'admin' LIMIT 1`, (err, row) => {
             if (err) console.error("Admin check error:", err.message);
@@ -276,7 +303,7 @@ app.get('/api/user/:username', authenticateToken, (req, res) => {
     if (req.user.role !== 'admin' && req.user.username.toLowerCase() !== req.params.username.toLowerCase()) {
         return res.status(403).json({ error: "Unauthorized access to another user's profile" });
     }
-    const query = `SELECT id, username, balance, taskEarnings, daily_earnings, affiliate_balance, my_referral_id, referred_by, planActivated, activePackage, role, created_at FROM users WHERE LOWER(username) = LOWER(?)`;
+    const query = `SELECT id, username, balance, taskEarnings, daily_earnings, affiliate_balance, my_referral_id, referred_by, planActivated, activePackage, role, full_name, phone, bank_name, bank_account_number, bank_account_holder, created_at FROM users WHERE LOWER(username) = LOWER(?)`;
     db.get(query, [req.params.username], (err, user) => {
         if (err || !user) return res.status(404).json({ error: "User not found" });
         res.json({ success: true, user });
@@ -285,7 +312,7 @@ app.get('/api/user/:username', authenticateToken, (req, res) => {
 
 app.post('/api/user/sync', authenticateToken, (req, res) => {
     const username = req.user.username;
-    const query = `SELECT id, username, balance, taskEarnings, daily_earnings, affiliate_balance, my_referral_id, referred_by, planActivated, activePackage, role, created_at FROM users WHERE LOWER(username) = LOWER(?)`;
+    const query = `SELECT id, username, balance, taskEarnings, daily_earnings, affiliate_balance, my_referral_id, referred_by, planActivated, activePackage, role, full_name, phone, bank_name, bank_account_number, bank_account_holder, created_at FROM users WHERE LOWER(username) = LOWER(?)`;
     db.get(query, [username], (err, user) => {
         if (err || !user) return res.status(404).json({ error: "User not found" });
         res.json({ success: true, user });
@@ -494,23 +521,41 @@ app.post('/api/activate', authenticateToken, actionLimiter, (req, res) => {
 });
 
 // ==========================================
-// 4. INSTANT AFFILIATE WITHDRAWAL ENGINE
+// 4. WITHDRAWAL REQUESTS (User initiated)
 // ==========================================
-app.post('/api/withdraw/affiliate', authenticateToken, actionLimiter, (req, res) => {
-    const { amount } = req.body;
-    if (!isValidAmount(amount)) return res.status(400).json({ error: "Valid amount required" });
-    const withdrawAmount = parseFloat(amount);
-    if (withdrawAmount < 3000) return res.status(400).json({ error: "Minimum referral withdrawal is ₦3,000" });
-    const fee = withdrawAmount * 0.05;
-    const netAmount = withdrawAmount - fee;
-    db.run(`UPDATE users SET affiliate_balance = affiliate_balance - ? WHERE id = ? AND affiliate_balance >= ?`, [withdrawAmount, req.user.id, withdrawAmount], function (err) {
-        if (err) return res.status(500).json({ error: "Database error during deduction." });
-        if (this.changes === 0) return res.status(400).json({ error: "Insufficient affiliate balance." });
-        db.run(`INSERT INTO withdrawals (username, amount, fee, total_deducted, wallet_type) VALUES (?, ?, ?, ?, 'affiliate')`, [req.user.username, netAmount, fee, withdrawAmount], function (err2) {
-            if (err2) return res.status(500).json({ error: "Failed to record withdrawal." });
-            res.json({ success: true, message: `Success! ₦${netAmount} (after 5% fee) is queued for instant payout.` });
+app.post('/api/request-withdrawal', authenticateToken, async (req, res) => {
+    try {
+        const { amount, wallet_type, bank_details } = req.body;
+        const username = req.user.username;
+        
+        if (!amount || amount < 3000) {
+            return res.status(400).json({ error: "Minimum withdrawal amount is ₦3,000" });
+        }
+        
+        let walletField = '';
+        if (wallet_type === 'affiliate') walletField = 'affiliate_balance';
+        else if (wallet_type === 'task') walletField = 'taskEarnings';
+        else walletField = 'balance';
+        
+        db.get(`SELECT ${walletField} as balance FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
+            if (err || !user) return res.status(404).json({ error: "User not found" });
+            if (user.balance < amount) return res.status(400).json({ error: "Insufficient balance" });
+            
+            db.run(`UPDATE users SET ${walletField} = ${walletField} - ? WHERE LOWER(username) = LOWER(?) AND ${walletField} >= ?`, 
+                [amount, username, amount], function(updateErr) {
+                if (updateErr || this.changes === 0) return res.status(500).json({ error: "Failed to process withdrawal" });
+                
+                db.run(`INSERT INTO withdrawals (username, amount, wallet_type, status, bank_details) 
+                        VALUES (?, ?, ?, 'pending', ?)`,
+                        [username, amount, wallet_type, JSON.stringify(bank_details || {})], function(err2) {
+                    if (err2) return res.status(500).json({ error: "Failed to create withdrawal request" });
+                    res.json({ success: true, message: "Withdrawal request submitted. Awaiting admin approval." });
+                });
+            });
         });
-    });
+    } catch (error) {
+        res.status(500).json({ error: "Server error" });
+    }
 });
 
 app.get('/api/admin/withdrawals', authenticateToken, adminOnly, (req, res) => {
@@ -530,7 +575,98 @@ app.post('/api/admin/approve-withdrawal', authenticateToken, adminOnly, (req, re
 });
 
 // ==========================================
-// 5. LIVE CHAT / CUSTOMER SUPPORT API
+// 5. DEPOSIT REQUESTS (User initiated)
+// ==========================================
+app.post('/api/request-deposit', authenticateToken, async (req, res) => {
+    try {
+        const { amount, payment_method, transaction_ref } = req.body;
+        const username = req.user.username;
+        
+        if (!amount || amount < 1000) {
+            return res.status(400).json({ error: "Minimum deposit amount is ₦1,000" });
+        }
+        
+        db.run(`INSERT INTO deposits (username, amount, sender_name, status, payment_method, transaction_ref) 
+                VALUES (?, ?, ?, 'pending', ?, ?)`,
+                [username, amount, username, payment_method || 'bank_transfer', transaction_ref || null], function(err) {
+            if (err) return res.status(500).json({ error: "Failed to create deposit request" });
+            res.json({ success: true, message: "Deposit request submitted. Awaiting admin approval." });
+        });
+    } catch (error) {
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
+app.get('/api/admin/deposits', authenticateToken, adminOnly, (req, res) => {
+    db.all(`SELECT * FROM deposits WHERE status = 'pending' ORDER BY created_at DESC`, [], (err, rows) => {
+        res.json({ success: true, deposits: rows });
+    });
+});
+
+app.post('/api/admin/approve-deposit', authenticateToken, adminOnly, (req, res) => {
+    const { depositId } = req.body;
+    if (!depositId) return res.status(400).json({ error: "Deposit ID required" });
+    db.get(`SELECT * FROM deposits WHERE id = ?`, [depositId], (err, deposit) => {
+        if (err || !deposit) return res.status(400).json({ error: "Deposit not found." });
+        db.run(`UPDATE deposits SET status = 'approved' WHERE id = ? AND status = 'pending'`, [deposit.id], function (updateErr) {
+            if (updateErr) return res.status(500).json({ error: "Database error" });
+            if (this.changes === 0) return res.status(400).json({ error: "Deposit already processed or not pending." });
+            db.run(`UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`, [deposit.amount, deposit.username], function (creditErr) {
+                if (creditErr) return res.status(500).json({ error: "Failed to credit user" });
+                console.warn(`[ADMIN] Deposit ${deposit.id} approved by ${req.user.username}`);
+                res.json({ success: true, message: `Deposit of ₦${deposit.amount} approved for ${deposit.username}` });
+            });
+        });
+    });
+});
+
+// ==========================================
+// 6. DAILY TASK CLAIM
+// ==========================================
+app.post('/api/claim-daily-task', authenticateToken, async (req, res) => {
+    try {
+        const username = req.user.username;
+        const { amount } = req.body;
+        
+        if (!amount || amount <= 0) {
+            return res.status(400).json({ error: "Invalid amount" });
+        }
+        
+        db.get(`SELECT taskEarnings, planActivated FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
+            if (err || !user) return res.status(404).json({ error: "User not found" });
+            
+            if (user.planActivated !== 'true') {
+                return res.status(403).json({ error: "You must activate a plan first" });
+            }
+            
+            const today = new Date().toISOString().split('T')[0];
+            db.get(`SELECT id FROM daily_claims WHERE username = ? AND claim_date = ?`, [username, today], async (err, claim) => {
+                if (claim) {
+                    return res.status(400).json({ error: "You have already claimed your daily task today. Come back tomorrow!" });
+                }
+                
+                const newTaskEarnings = (user.taskEarnings || 0) + amount;
+                
+                db.run(`UPDATE users SET taskEarnings = ? WHERE LOWER(username) = LOWER(?)`, [newTaskEarnings, username], function(updateErr) {
+                    if (updateErr) return res.status(500).json({ error: "Failed to update earnings" });
+                    
+                    db.run(`INSERT INTO daily_claims (username, claim_date, amount) VALUES (?, ?, ?)`, [username, today, amount]);
+                    
+                    res.json({ 
+                        success: true, 
+                        message: `Successfully claimed ₦${amount}!`, 
+                        newBalance: newTaskEarnings 
+                    });
+                });
+            });
+        });
+    } catch (error) {
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
+// ==========================================
+// 7. LIVE CHAT / CUSTOMER SUPPORT API
 // ==========================================
 app.get('/api/chat/history/:username', authenticateToken, (req, res) => {
     if (req.user.role !== 'admin' && req.user.username.toLowerCase() !== req.params.username.toLowerCase()) {
@@ -560,39 +696,8 @@ app.get('/api/support/users', authenticateToken, adminOnly, (req, res) => {
 });
 
 // ==========================================
-// 6. ADMIN COMMAND CENTER & UTILITIES
+// 8. ADMIN COMMAND CENTER & UTILITIES
 // ==========================================
-app.post('/api/deposit', authenticateToken, actionLimiter, (req, res) => {
-    const { amount, senderName } = req.body;
-    if (!isValidAmount(amount) || !senderName) return res.status(400).json({ error: "Valid amount and sender name required" });
-    db.run(`INSERT INTO deposits (username, amount, sender_name, status) VALUES (?, ?, ?, 'pending')`, [req.user.username, parseFloat(amount), senderName], function () {
-        res.json({ success: true, message: "Deposit request submitted for admin approval" });
-    });
-});
-
-app.get('/api/admin/deposits', authenticateToken, adminOnly, (req, res) => {
-    db.all(`SELECT * FROM deposits WHERE status = 'pending' ORDER BY created_at DESC`, [], (err, rows) => {
-        res.json({ success: true, deposits: rows });
-    });
-});
-
-app.post('/api/admin/approve-deposit', authenticateToken, adminOnly, (req, res) => {
-    const { depositId } = req.body;
-    if (!depositId) return res.status(400).json({ error: "Deposit ID required" });
-    db.get(`SELECT * FROM deposits WHERE id = ?`, [depositId], (err, deposit) => {
-        if (err || !deposit) return res.status(400).json({ error: "Deposit not found." });
-        db.run(`UPDATE deposits SET status = 'approved' WHERE id = ? AND status = 'pending'`, [deposit.id], function (updateErr) {
-            if (updateErr) return res.status(500).json({ error: "Database error" });
-            if (this.changes === 0) return res.status(400).json({ error: "Deposit already processed or not pending." });
-            db.run(`UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`, [deposit.amount, deposit.username], function (creditErr) {
-                if (creditErr) return res.status(500).json({ error: "Failed to credit user" });
-                console.warn(`[ADMIN] Deposit ${deposit.id} approved by ${req.user.username}`);
-                res.json({ success: true, message: `Deposit of ₦${deposit.amount} approved for ${deposit.username}` });
-            });
-        });
-    });
-});
-
 app.post('/api/admin/manual-credit', authenticateToken, adminOnly, (req, res) => {
     const { username, amount, walletType } = req.body;
     if (!username || !isValidAmount(amount)) return res.status(400).json({ error: "Username and valid amount required" });
@@ -635,7 +740,7 @@ app.get('/api/admin/stats', authenticateToken, adminOnly, (req, res) => {
 });
 
 // ==========================================
-// 7. REFERRAL SYSTEM ENDPOINTS
+// 9. REFERRAL SYSTEM ENDPOINTS (Enhanced)
 // ==========================================
 app.get('/api/referral/stats/:username', authenticateToken, (req, res) => {
     const username = req.params.username;
@@ -644,7 +749,14 @@ app.get('/api/referral/stats/:username', authenticateToken, (req, res) => {
         const myRefId = user.my_referral_id;
         db.get(`SELECT COUNT(*) as count, COALESCE(SUM(affiliate_balance), 0) as earnings FROM users WHERE referred_by = ?`, [myRefId], (err2, stats) => {
             if (err2) return res.status(500).json({ error: "Database error" });
-            res.json({ success: true, totalReferrals: stats.count || 0, earnings: stats.earnings || 0 });
+            db.all(`SELECT username, created_at, planActivated FROM users WHERE referred_by = ? ORDER BY created_at DESC`, [myRefId], (err3, referrals) => {
+                res.json({ 
+                    success: true, 
+                    totalReferrals: stats.count || 0, 
+                    earnings: stats.earnings || 0,
+                    referrals: referrals || []
+                });
+            });
         });
     });
 });
@@ -657,10 +769,8 @@ app.get('/api/referral/leaderboard', (req, res) => {
 });
 
 // ==========================================
-// 8. USER PROFILE & BANK DETAILS (NEW)
+// 10. USER PROFILE & BANK DETAILS
 // ==========================================
-
-// Get user profile (including full_name, phone, bank fields)
 app.get('/api/user/profile/:username', authenticateToken, (req, res) => {
     if (req.user.username !== req.params.username && req.user.role !== 'admin') {
         return res.status(403).json({ error: "Unauthorized" });
@@ -672,12 +782,10 @@ app.get('/api/user/profile/:username', authenticateToken, (req, res) => {
         });
 });
 
-// Update profile (full_name, phone)
 app.post('/api/user/update-profile', authenticateToken, async (req, res) => {
     try {
         const { full_name, phone } = req.body;
         const username = req.user.username;
-
         db.run(`UPDATE users SET full_name = ?, phone = ? WHERE LOWER(username) = LOWER(?)`,
             [full_name || null, phone || null, username], function(err) {
                 if (err) return res.status(500).json({ error: "Database error" });
@@ -688,16 +796,13 @@ app.post('/api/user/update-profile', authenticateToken, async (req, res) => {
     }
 });
 
-// Update bank details
 app.post('/api/user/update-bank', authenticateToken, async (req, res) => {
     try {
         const { bank_name, account_number, account_holder } = req.body;
         const username = req.user.username;
-
         if (!bank_name || !account_number || !account_holder) {
             return res.status(400).json({ error: "All bank fields are required" });
         }
-
         db.run(`UPDATE users SET bank_name = ?, bank_account_number = ?, bank_account_holder = ? WHERE LOWER(username) = LOWER(?)`,
             [bank_name, account_number, account_holder, username], function(err) {
                 if (err) return res.status(500).json({ error: "Database error" });
@@ -708,26 +813,91 @@ app.post('/api/user/update-bank', authenticateToken, async (req, res) => {
     }
 });
 
-// Change password (requires current password)
 app.post('/api/user/change-password', authenticateToken, async (req, res) => {
     try {
         const { current_password, new_password } = req.body;
         const username = req.user.username;
-
         if (!current_password || !new_password || new_password.length < 6) {
             return res.status(400).json({ error: "Current password and new password (min 6 chars) required" });
         }
-
         db.get(`SELECT password FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
             if (err || !user) return res.status(404).json({ error: "User not found" });
-
             const valid = await bcryptjs.compare(current_password, user.password);
             if (!valid) return res.status(401).json({ error: "Current password is incorrect" });
-
             const hashed = await bcryptjs.hash(new_password, 10);
             db.run(`UPDATE users SET password = ? WHERE LOWER(username) = LOWER(?)`, [hashed, username], function(updateErr) {
                 if (updateErr) return res.status(500).json({ error: "Database error" });
                 res.json({ success: true, message: "Password changed successfully" });
+            });
+        });
+    } catch (error) {
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
+// ==========================================
+// 11. ADMIN BROADCAST MESSAGE
+// ==========================================
+app.post('/api/admin/broadcast', authenticateToken, adminOnly, async (req, res) => {
+    try {
+        const { message, title } = req.body;
+        if (!message) return res.status(400).json({ error: "Message is required" });
+        db.run(`INSERT INTO broadcasts (title, message, created_by, created_at) VALUES (?, ?, ?, datetime('now'))`, 
+            [title || 'Admin Announcement', message, req.user.username], function(err) {
+            if (err) return res.status(500).json({ error: "Failed to save broadcast" });
+            res.json({ success: true, message: "Broadcast sent to all users" });
+        });
+    } catch (error) {
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
+app.get('/api/broadcasts', authenticateToken, (req, res) => {
+    db.all(`SELECT * FROM broadcasts ORDER BY created_at DESC LIMIT 50`, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: "Database error" });
+        res.json({ success: true, broadcasts: rows || [] });
+    });
+});
+
+// ==========================================
+// 12. ADMIN SPONSORED POSTS MANAGEMENT
+// ==========================================
+app.post('/api/admin/sponsored-post', authenticateToken, adminOnly, async (req, res) => {
+    try {
+        const { title, description, reward_amount, required_plan, image_url, link } = req.body;
+        if (!title || !description || !reward_amount) {
+            return res.status(400).json({ error: "Title, description and reward amount are required" });
+        }
+        db.run(`INSERT INTO sponsored_posts (title, description, reward_amount, required_plan, image_url, link, created_by) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                [title, description, reward_amount, required_plan || 'all', image_url || null, link || null, req.user.username], function(err) {
+            if (err) return res.status(500).json({ error: "Failed to create sponsored post" });
+            res.json({ success: true, message: "Sponsored post created successfully" });
+        });
+    } catch (error) {
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
+app.get('/api/sponsored-posts', authenticateToken, (req, res) => {
+    const userPlan = req.user.activePackage || 'None';
+    db.all(`SELECT * FROM sponsored_posts WHERE status = 'active' AND (required_plan = 'all' OR required_plan = ?) ORDER BY created_at DESC`, 
+        [userPlan], (err, rows) => {
+        if (err) return res.status(500).json({ error: "Database error" });
+        res.json({ success: true, posts: rows || [] });
+    });
+});
+
+app.post('/api/claim-sponsored-post', authenticateToken, async (req, res) => {
+    try {
+        const { post_id } = req.body;
+        const username = req.user.username;
+        db.get(`SELECT reward_amount FROM sponsored_posts WHERE id = ? AND status = 'active'`, [post_id], (err, post) => {
+            if (err || !post) return res.status(404).json({ error: "Post not found" });
+            db.run(`UPDATE users SET taskEarnings = taskEarnings + ? WHERE LOWER(username) = LOWER(?)`, 
+                [post.reward_amount, username], function(updateErr) {
+                if (updateErr) return res.status(500).json({ error: "Failed to credit reward" });
+                res.json({ success: true, message: `Claimed ₦${post.reward_amount} successfully!` });
             });
         });
     } catch (error) {
@@ -806,9 +976,6 @@ app.get('/debug/check-users', (req, res) => {
     });
 });
 
-// ==========================================
-// 🔧 FIX MISSING REFERRAL IDs (RUN THIS ONCE)
-// ==========================================
 app.get('/debug/fix-referral-ids', (req, res) => {
     db.run(`UPDATE users SET my_referral_id = 'AW' || upper(hex(randomblob(4))) WHERE my_referral_id IS NULL OR my_referral_id = ''`, function(err) {
         if (err) {
