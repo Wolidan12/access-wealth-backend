@@ -695,6 +695,31 @@ app.get('/api/support/users', authenticateToken, adminOnly, (req, res) => {
     });
 });
 
+// ✅ NEW: Auto send welcome message when user first opens chat
+app.post('/api/chat/welcome', authenticateToken, async (req, res) => {
+    try {
+        const username = req.user.username;
+        const welcomeMessage = "👋 Hello! I'm an Access Wealth support agent. How may I help you today?";
+        
+        // Check if user already has any messages
+        db.get(`SELECT id FROM messages WHERE user_id = ? LIMIT 1`, [username], (err, existing) => {
+            if (err) return res.status(500).json({ error: "Database error" });
+            
+            if (!existing) {
+                db.run(`INSERT INTO messages (user_id, sender, message) VALUES (?, 'support', ?)`,
+                    [username, welcomeMessage], function(insertErr) {
+                    if (insertErr) return res.status(500).json({ error: "Failed to send welcome" });
+                    res.json({ success: true, message: "Welcome message sent" });
+                });
+            } else {
+                res.json({ success: true, message: "Already has messages" });
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
 // ==========================================
 // 8. ADMIN COMMAND CENTER & UTILITIES
 // ==========================================
