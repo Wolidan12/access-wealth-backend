@@ -243,6 +243,15 @@ db.serialize(() => {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
+    // ✅ NEW TABLE: Sponsored post submissions (for admin review)
+    db.run(`CREATE TABLE IF NOT EXISTS sponsored_submissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        post_id INTEGER,
+        username TEXT,
+        status TEXT DEFAULT 'pending',
+        submitted_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
     // Admin and support accounts
     setTimeout(() => {
         db.get(`SELECT id FROM users WHERE role = 'admin' LIMIT 1`, (err, row) => {
@@ -559,7 +568,7 @@ app.post('/api/request-withdrawal', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/admin/withdrawals', authenticateToken, adminOnly, (req, res) => {
-    db.all(`SELECT * FROM withdrawals WHERE status = 'pending' ORDER BY created_at ASC`, [], (err, rows) => {
+    db.all(`SELECT id, username, amount, wallet_type, bank_details, status, created_at FROM withdrawals WHERE status = 'pending' ORDER BY created_at ASC`, [], (err, rows) => {
         res.json({ success: true, withdrawals: rows || [] });
     });
 });
@@ -734,6 +743,46 @@ app.post('/api/chat/welcome', authenticateToken, async (req, res) => {
 // ==========================================
 // 8. ADMIN COMMAND CENTER & UTILITIES
 // ==========================================
+
+// ✅ NEW: Admin can adjust user balance (increase or decrease)
+app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, res) => {
+    try {
+        const { username, amount, walletType, action } = req.body;
+        
+        if (!username || !isValidAmount(amount)) {
+            return res.status(400).json({ error: "Username and valid amount required" });
+        }
+        
+        let query = "";
+        const actionSign = action === 'subtract' ? '-' : '+';
+        
+        switch (walletType) {
+            case 'taskEarnings': query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
+            case 'daily_earnings': query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
+            case 'affiliate_balance': query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
+            default: query = `UPDATE users SET balance = COALESCE(balance, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
+        }
+        
+        db.run(query, [parseFloat(amount), username], function(err) {
+            if (err) return res.status(500).json({ error: "Database error." });
+            if (this.changes === 0) return res.status(400).json({ error: "User not found" });
+            
+            console.warn(`[ADMIN] ${action === 'subtract' ? 'Subtracted' : 'Added'} ₦${amount} to ${username}'s ${walletType || 'balance'} by ${req.user.username}`);
+            res.json({ success: true, message: `Successfully ${action === 'subtract' ? 'subtracted' : 'added'} ₦${amount} to ${username}'s wallet!` });
+        });
+    } catch (error) {
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
+// ✅ NEW: Get all broadcasts for user dashboard
+app.get('/api/broadcasts/all', authenticateToken, (req, res) => {
+    db.all(`SELECT * FROM broadcasts ORDER BY created_at DESC LIMIT 50`, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: "Database error" });
+        res.json({ success: true, broadcasts: rows || [] });
+    });
+});
+
 app.post('/api/admin/manual-credit', authenticateToken, adminOnly, (req, res) => {
     const { username, amount, walletType } = req.body;
     if (!username || !isValidAmount(amount)) return res.status(400).json({ error: "Username and valid amount required" });
@@ -924,21 +973,81 @@ app.get('/api/sponsored-posts', authenticateToken, (req, res) => {
     });
 });
 
-app.post('/api/claim-sponsored-post', authenticateToken, async (req, res) => {
+// ✅ NEW: User submits sponsored post task for review
+app.post('/api/submit-sponsored-task', authenticateToken, async (req, res) => {
     try {
         const { post_id } = req.body;
         const username = req.user.username;
-        db.get(`SELECT reward_amount FROM sponsored_posts WHERE id = ? AND status = 'active'`, [post_id], (err, post) => {
+        
+        if (!post_id) return res.status(400).json({ error: "Post ID required" });
+        
+        db.get(`SELECT id FROM sponsored_posts WHERE id = ? AND status = 'active'`, [post_id], (err, post) => {
             if (err || !post) return res.status(404).json({ error: "Post not found" });
-            db.run(`UPDATE users SET taskEarnings = taskEarnings + ? WHERE LOWER(username) = LOWER(?)`, 
-                [post.reward_amount, username], function(updateErr) {
-                if (updateErr) return res.status(500).json({ error: "Failed to credit reward" });
-                res.json({ success: true, message: `Claimed ₦${post.reward_amount} successfully!` });
+            
+            // Check if user already submitted this post
+            db.get(`SELECT id FROM sponsored_submissions WHERE post_id = ? AND username = ?`, [post_id, username], (err, existing) => {
+                if (existing) return res.status(400).json({ error: "You have already submitted this task" });
+                
+                db.run(`INSERT INTO sponsored_submissions (post_id, username, status) VALUES (?, ?, 'pending')`,
+                    [post_id, username], function(insertErr) {
+                    if (insertErr) return res.status(500).json({ error: "Failed to submit task" });
+                    res.json({ success: true, message: "Task submitted for admin review!" });
+                });
             });
         });
     } catch (error) {
         res.status(500).json({ error: "Server error" });
     }
+});
+
+// ✅ NEW: Admin gets all sponsored submissions for review
+app.get('/api/admin/sponsored-submissions', authenticateToken, adminOnly, (req, res) => {
+    db.all(`
+        SELECT s.*, p.title, p.reward_amount, p.description 
+        FROM sponsored_submissions s 
+        JOIN sponsored_posts p ON s.post_id = p.id 
+        WHERE s.status = 'pending' 
+        ORDER BY s.submitted_at ASC
+    `, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: "Database error" });
+        res.json({ success: true, submissions: rows || [] });
+    });
+});
+
+// ✅ NEW: Admin approves sponsored submission and credits user
+app.post('/api/admin/approve-sponsored-submission', authenticateToken, adminOnly, async (req, res) => {
+    try {
+        const { submission_id } = req.body;
+        if (!submission_id) return res.status(400).json({ error: "Submission ID required" });
+        
+        db.get(`SELECT * FROM sponsored_submissions WHERE id = ? AND status = 'pending'`, [submission_id], (err, submission) => {
+            if (err || !submission) return res.status(404).json({ error: "Submission not found" });
+            
+            db.run(`UPDATE sponsored_submissions SET status = 'approved' WHERE id = ?`, [submission_id], function(updateErr) {
+                if (updateErr) return res.status(500).json({ error: "Failed to update submission" });
+                
+                // Credit the user
+                db.run(`UPDATE users SET taskEarnings = taskEarnings + ? WHERE LOWER(username) = LOWER(?)`,
+                    [submission.reward_amount, submission.username], function(creditErr) {
+                    if (creditErr) return res.status(500).json({ error: "Failed to credit user" });
+                    res.json({ success: true, message: "Submission approved and user credited!" });
+                });
+            });
+        });
+    } catch (error) {
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
+// ✅ NEW: Check if user has already submitted a specific sponsored post
+app.get('/api/sponsored-submission-status/:post_id', authenticateToken, (req, res) => {
+    const username = req.user.username;
+    const post_id = req.params.post_id;
+    
+    db.get(`SELECT status FROM sponsored_submissions WHERE post_id = ? AND username = ?`, [post_id, username], (err, row) => {
+        if (err) return res.status(500).json({ error: "Database error" });
+        res.json({ success: true, status: row ? row.status : 'not_submitted' });
+    });
 });
 
 // Premium feature helper (ads, bills, sms)
