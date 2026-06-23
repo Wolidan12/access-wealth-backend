@@ -165,6 +165,8 @@ db.serialize(() => {
         status TEXT DEFAULT 'pending',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
+
+    // ✅ UPDATED withdrawals table with all required columns
     db.run(`CREATE TABLE IF NOT EXISTS withdrawals (
         id INTEGER PRIMARY KEY AUTOINCREMENT, 
         username TEXT, 
@@ -179,6 +181,21 @@ db.serialize(() => {
         reviewed_at DATETIME,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
+
+    // ✅ Add missing columns if table already existed without them
+    db.run(`ALTER TABLE withdrawals ADD COLUMN bank_details TEXT`, (err) => {
+        if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
+    });
+    db.run(`ALTER TABLE withdrawals ADD COLUMN admin_note TEXT`, (err) => {
+        if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
+    });
+    db.run(`ALTER TABLE withdrawals ADD COLUMN reviewed_by TEXT`, (err) => {
+        if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
+    });
+    db.run(`ALTER TABLE withdrawals ADD COLUMN reviewed_at DATETIME`, (err) => {
+        if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
+    });
+
     db.run(`CREATE TABLE IF NOT EXISTS ads (
         id INTEGER PRIMARY KEY AUTOINCREMENT, 
         username TEXT, 
@@ -765,7 +782,6 @@ app.post('/api/claim-daily-task', authenticateToken, async (req, res) => {
 // 7. LIVE CHAT / CUSTOMER SUPPORT API
 // ==========================================
 app.get('/api/chat/history/:username', authenticateToken, (req, res) => {
-    // Allow admin, support agent, or the user themselves
     if (req.user.role !== 'admin' && req.user.role !== 'support' && req.user.username.toLowerCase() !== req.params.username.toLowerCase()) {
         return res.status(403).json({ error: "Unauthorized access" });
     }
