@@ -42,6 +42,8 @@ app.use(express.json({
     }
 }));
 
+const frontendPublicDir = path.join(__dirname, '..', 'frontend', 'public');
+app.use(express.static(frontendPublicDir));
 app.use(express.static(__dirname));
 app.use((req, res, next) => {
     console.log(`[RADAR] ${req.method} request at: ${req.url}`);
