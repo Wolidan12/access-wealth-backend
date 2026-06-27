@@ -42,8 +42,6 @@ app.use(express.json({
     }
 }));
 
-const frontendPublicDir = path.join(__dirname, '..', 'frontend', 'public');
-app.use(express.static(frontendPublicDir));
 app.use(express.static(__dirname));
 app.use((req, res, next) => {
     console.log(`[RADAR] ${req.method} request at: ${req.url}`);
@@ -167,8 +165,6 @@ db.serialize(() => {
         status TEXT DEFAULT 'pending',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
-
-    // ✅ UPDATED withdrawals table with all required columns
     db.run(`CREATE TABLE IF NOT EXISTS withdrawals (
         id INTEGER PRIMARY KEY AUTOINCREMENT, 
         username TEXT, 
@@ -183,8 +179,6 @@ db.serialize(() => {
         reviewed_at DATETIME,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
-
-    // ✅ Add missing columns if table already existed without them
     db.run(`ALTER TABLE withdrawals ADD COLUMN bank_details TEXT`, (err) => {
         if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
     });
@@ -573,34 +567,22 @@ app.post('/api/request-withdrawal', authenticateToken, async (req, res) => {
             
             db.run(`UPDATE users SET ${walletField} = ${walletField} - ? WHERE LOWER(username) = LOWER(?) AND ${walletField} >= ?`, 
                 [amount, username, amount], function(updateErr) {
-                if (updateErr) {
-                    console.error("Update error:", updateErr.message);
-                    return res.status(500).json({ error: "Failed to process withdrawal" });
-                }
-                if (this.changes === 0) {
-                    return res.status(400).json({ error: "Insufficient balance or user not found" });
-                }
+                if (updateErr || this.changes === 0) return res.status(500).json({ error: "Failed to process withdrawal" });
                 
                 const bankDetailsStr = JSON.stringify(bank_details || {});
-                
                 db.run(`INSERT INTO withdrawals (username, amount, wallet_type, status, bank_details, created_at) 
                         VALUES (?, ?, ?, 'pending', ?, datetime('now'))`,
                         [username, amount, wallet_type, bankDetailsStr], function(err2) {
-                    if (err2) {
-                        console.error("Insert error:", err2.message);
-                        return res.status(500).json({ error: "Failed to create withdrawal request: " + err2.message });
-                    }
+                    if (err2) return res.status(500).json({ error: "Failed to create withdrawal request" });
                     res.json({ success: true, message: "Withdrawal request submitted. Awaiting admin approval." });
                 });
             });
         });
     } catch (error) {
-        console.error("Withdrawal error:", error);
-        res.status(500).json({ error: "Server error: " + error.message });
+        res.status(500).json({ error: "Server error" });
     }
 });
 
-// Admin gets all withdrawals by status
 app.get('/api/admin/withdrawals', authenticateToken, adminOnly, (req, res) => {
     const status = req.query.status || 'pending';
     db.all(`SELECT id, username, amount, wallet_type, bank_details, status, admin_note, reviewed_by, created_at, reviewed_at 
@@ -610,7 +592,6 @@ app.get('/api/admin/withdrawals', authenticateToken, adminOnly, (req, res) => {
     });
 });
 
-// Get all withdrawals for admin (all statuses)
 app.get('/api/admin/all-withdrawals', authenticateToken, adminOnly, (req, res) => {
     db.all(`SELECT id, username, amount, wallet_type, bank_details, status, admin_note, reviewed_by, created_at, reviewed_at 
             FROM withdrawals ORDER BY created_at DESC`, [], (err, rows) => {
@@ -619,14 +600,11 @@ app.get('/api/admin/all-withdrawals', authenticateToken, adminOnly, (req, res) =
     });
 });
 
-// Admin approves withdrawal with note
 app.post('/api/admin/approve-withdrawal', authenticateToken, adminOnly, (req, res) => {
     const { id, note } = req.body;
     if (!id) return res.status(400).json({ error: "Withdrawal ID required" });
-    
     db.get(`SELECT * FROM withdrawals WHERE id = ? AND status = 'pending'`, [id], (err, withdrawal) => {
         if (err || !withdrawal) return res.status(404).json({ error: "Withdrawal not found or already processed" });
-        
         db.run(`UPDATE withdrawals SET status = 'approved', admin_note = ?, reviewed_by = ?, reviewed_at = datetime('now') 
                 WHERE id = ? AND status = 'pending'`,
                 [note || 'Your withdrawal has been approved. Money is on the way!', req.user.username, id], function(updateErr) {
@@ -638,24 +616,18 @@ app.post('/api/admin/approve-withdrawal', authenticateToken, adminOnly, (req, re
     });
 });
 
-// Admin declines withdrawal with note (refund the user)
 app.post('/api/admin/decline-withdrawal', authenticateToken, adminOnly, (req, res) => {
     const { id, note } = req.body;
     if (!id) return res.status(400).json({ error: "Withdrawal ID required" });
-    
     db.get(`SELECT * FROM withdrawals WHERE id = ? AND status = 'pending'`, [id], (err, withdrawal) => {
         if (err || !withdrawal) return res.status(404).json({ error: "Withdrawal not found or already processed" });
-        
-        // Refund the user (add money back)
         let walletField = '';
         if (withdrawal.wallet_type === 'affiliate') walletField = 'affiliate_balance';
         else if (withdrawal.wallet_type === 'task') walletField = 'taskEarnings';
         else walletField = 'balance';
-        
         db.run(`UPDATE users SET ${walletField} = ${walletField} + ? WHERE LOWER(username) = LOWER(?)`,
-                [withdrawal.amount, withdrawal.username], function(refundErr) {
+            [withdrawal.amount, withdrawal.username], function(refundErr) {
             if (refundErr) return res.status(500).json({ error: "Failed to refund user" });
-            
             db.run(`UPDATE withdrawals SET status = 'declined', admin_note = ?, reviewed_by = ?, reviewed_at = datetime('now') 
                     WHERE id = ? AND status = 'pending'`,
                     [note || 'Your withdrawal was declined. Please contact support for assistance.', req.user.username, id], function(updateErr) {
@@ -668,7 +640,6 @@ app.post('/api/admin/decline-withdrawal', authenticateToken, adminOnly, (req, re
     });
 });
 
-// Get user's withdrawal history with status and notes
 app.get('/api/user/withdrawals', authenticateToken, (req, res) => {
     const username = req.user.username;
     db.all(`SELECT id, amount, wallet_type, status, admin_note, created_at, reviewed_at 
@@ -678,7 +649,6 @@ app.get('/api/user/withdrawals', authenticateToken, (req, res) => {
     });
 });
 
-// Check if user has pending withdrawal
 app.get('/api/user/pending-withdrawal', authenticateToken, (req, res) => {
     const username = req.user.username;
     db.get(`SELECT id FROM withdrawals WHERE username = ? AND status = 'pending' LIMIT 1`, [username], (err, row) => {
@@ -822,8 +792,6 @@ app.post('/api/chat/welcome', authenticateToken, async (req, res) => {
 // ==========================================
 // 8. ADMIN COMMAND CENTER & UTILITIES
 // ==========================================
-
-// ✅ NEW: Admin can adjust user balance (increase or decrease)
 app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, res) => {
     try {
         const { username, amount, walletType, action } = req.body;
@@ -892,7 +860,7 @@ app.get('/api/admin/stats', authenticateToken, adminOnly, (req, res) => {
 });
 
 // ==========================================
-// 9. REFERRAL SYSTEM ENDPOINTS (Enhanced)
+// 9. REFERRAL SYSTEM ENDPOINTS
 // ==========================================
 app.get('/api/referral/stats/:username', authenticateToken, (req, res) => {
     const username = req.params.username;
@@ -1153,7 +1121,7 @@ app.post('/api/sms/send', authenticateToken, actionLimiter, (req, res) => {
 });
 
 // ==========================================
-// DEBUG ROUTES (REMOVE AFTER USE)
+// DEBUG ROUTES
 // ==========================================
 app.get('/debug/ensure-admin', async (req, res) => {
     try {
