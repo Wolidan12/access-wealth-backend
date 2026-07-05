@@ -185,6 +185,10 @@ db.serialize(() => {
         { name: 'bank_name', type: 'TEXT' },
         { name: 'bank_account_number', type: 'TEXT' },
         { name: 'bank_account_holder', type: 'TEXT' },
+        { name: 'bank_code', type: 'TEXT' },
+        // Paystack recipient information - stored to avoid creating duplicate recipients
+        { name: 'paystack_recipient_code', type: 'TEXT' },
+        { name: 'paystack_recipient_id', type: 'TEXT' },
         { name: 'created_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' },
         { name: 'status', type: 'TEXT DEFAULT \'active\'' }
     ];
@@ -243,6 +247,16 @@ db.serialize(() => {
         if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
     });
     db.run(`ALTER TABLE withdrawals ADD COLUMN reviewed_at DATETIME`, (err) => {
+        if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
+    });
+    // Add Paystack transfer tracking columns
+    db.run(`ALTER TABLE withdrawals ADD COLUMN paystack_transfer_reference TEXT`, (err) => {
+        if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
+    });
+    db.run(`ALTER TABLE withdrawals ADD COLUMN paystack_transfer_date DATETIME`, (err) => {
+        if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
+    });
+    db.run(`ALTER TABLE withdrawals ADD COLUMN paystack_failure_reason TEXT`, (err) => {
         if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
     });
 
