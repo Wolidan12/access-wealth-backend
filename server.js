@@ -943,20 +943,47 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
 
 app.post('/api/admin/manual-credit', authenticateToken, adminOnly, (req, res) => {
     const { username, amount, walletType } = req.body;
-    if (!username || !isValidAmount(amount)) return res.status(400).json({ error: "Username and valid amount required" });
+    console.log('[MANUAL-CREDIT DEBUG] Request:', { username, amount, walletType, adminUser: req.user?.username });
     
-    let query = "";
-    switch (walletType) {
-        case 'taskEarnings': query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
-        case 'daily_earnings': query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
-        case 'affiliate_balance': query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
-        default: query = `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
+    if (!username || !isValidAmount(amount)) {
+        console.log('[MANUAL-CREDIT DEBUG] Validation failed');
+        return res.status(400).json({ error: "Username and valid amount required" });
     }
-    db.run(query, [parseFloat(amount), username], function (err) {
-        if (err) return res.status(500).json({ error: "Database error." });
-        if (this.changes === 0) return res.status(400).json({ error: "User not found" });
-        console.warn(`[ADMIN] Manual credit of ₦${amount} to ${username}'s ${walletType || 'balance'} by ${req.user.username}`);
-        res.json({ success: true, message: `Successfully credited ₦${amount} to ${username}'s wallet!` });
+    
+    // First, check if user exists and log their current balance
+    db.get(`SELECT id, username, balance, taskEarnings, daily_earnings, affiliate_balance FROM users WHERE LOWER(username) = LOWER(?)`, [username], (checkErr, user) => {
+        if (checkErr || !user) {
+            console.log('[MANUAL-CREDIT DEBUG] User not found:', username);
+            return res.status(400).json({ error: "User not found" });
+        }
+        console.log('[MANUAL-CREDIT DEBUG] User found:', { id: user.id, username: user.username, currentBalance: user.balance, currentTaskEarnings: user.taskEarnings, currentDaily: user.daily_earnings, currentAffiliate: user.affiliate_balance });
+        
+        let query = "";
+        switch (walletType) {
+            case 'taskEarnings': query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
+            case 'daily_earnings': query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
+            case 'affiliate_balance': query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
+            default: query = `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
+        }
+        
+        console.log('[MANUAL-CREDIT DEBUG] Executing query:', query);
+        db.run(query, [parseFloat(amount), username], function (err) {
+            if (err) {
+                console.error('[MANUAL-CREDIT DEBUG] Database error:', err.message, err);
+                return res.status(500).json({ error: "Database error: " + err.message });
+            }
+            console.log('[MANUAL-CREDIT DEBUG] Update result - changes:', this.changes);
+            if (this.changes === 0) {
+                return res.status(400).json({ error: "User not found" });
+            }
+            
+            // Verify the update worked by fetching updated balance
+            db.get(`SELECT balance, taskEarnings, daily_earnings, affiliate_balance FROM users WHERE LOWER(username) = LOWER(?)`, [username], (verifyErr, updatedUser) => {
+                console.log('[MANUAL-CREDIT DEBUG] Updated user:', updatedUser);
+                console.warn(`[ADMIN] Manual credit of ₦${amount} to ${username}'s ${walletType || 'balance'} by ${req.user.username}`);
+                res.json({ success: true, message: `Successfully credited ₦${amount} to ${username}'s wallet!` });
+            });
+        });
     });
 });
 });
