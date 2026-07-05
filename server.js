@@ -935,11 +935,21 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
 
 app.post('/api/admin/manual-credit', authenticateToken, adminOnly, (req, res) => {
     const { username, amount, walletType } = req.body;
-    if (!username || !isValidAmount(amount)) return res.status(400).json({ error: "Username and valid amount required" });
+    console.log('[MANUAL CREDIT] Request received:', { username, amount, walletType, adminUsername: req.user?.username });
+    if (!username || !isValidAmount(amount)) {
+        console.warn('[MANUAL CREDIT] Validation failed:', { username, amount, valid: isValidAmount(amount) });
+        return res.status(400).json({ error: "Username and valid amount required" });
+    }
 
     applyWalletDelta(username, amount, walletType, 'add', (err, updated) => {
-        if (err) return res.status(500).json({ error: "Database error." });
-        if (!updated) return res.status(400).json({ error: "User not found" });
+        if (err) {
+            console.error('[MANUAL CREDIT] Database error:', err.message);
+            return res.status(500).json({ error: "Database error: " + err.message });
+        }
+        if (!updated) {
+            console.warn('[MANUAL CREDIT] User not found:', username);
+            return res.status(400).json({ error: "User not found" });
+        }
         console.warn(`[ADMIN] Manual credit of ₦${amount} to ${username}'s ${walletType || 'balance'} by ${req.user.username}`);
         res.json({ success: true, message: `Successfully credited ₦${amount} to ${username}'s wallet!` });
     });
