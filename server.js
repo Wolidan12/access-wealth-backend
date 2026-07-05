@@ -31,7 +31,7 @@ if (!process.env.PAYSTACK_SECRET_KEY) {
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
 
-const allowedOrigins = (process.env.FRONTEND_URL || 'https://accesswealthhq.com,http://localhost:3000').split(',');
+const allowedOrigins = (process.env.FRONTEND_URL || 'https://accesswealthhq.com,http://localhost:3000,http://127.0.0.1:3000,http://127.0.0.1:5500,http://localhost:5500,http://127.0.0.1:5173,http://localhost:5173').split(',');
 app.use(cors({
     origin: function (origin, callback) {
         if (!origin) return callback(null, true);
@@ -66,6 +66,47 @@ function isValidAmount(val) {
 
 function isValidEmail(email) {
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function resolveWalletField(walletType) {
+    const normalized = String(walletType || 'balance').trim().toLowerCase();
+    switch (normalized) {
+        case 'task':
+        case 'taskearnings':
+        case 'task_earnings':
+        case 'engagement':
+        case 'engagements':
+            return 'taskEarnings';
+        case 'daily':
+        case 'dailyearnings':
+        case 'daily_earnings':
+            return 'daily_earnings';
+        case 'affiliate':
+        case 'affiliatebalance':
+        case 'affiliate_balance':
+            return 'affiliate_balance';
+        case 'deposit':
+        case 'main':
+        case 'wallet':
+        case 'balance':
+        default:
+            return 'balance';
+    }
+}
+
+function applyWalletDelta(username, amount, walletType, action, callback) {
+    const field = resolveWalletField(walletType);
+    const delta = Math.abs(parseFloat(amount));
+    if (!Number.isFinite(delta) || delta <= 0) return callback(new Error('Invalid amount'), false);
+
+    const query = action === 'subtract'
+        ? `UPDATE users SET ${field} = COALESCE(${field}, 0) - ? WHERE LOWER(username) = LOWER(?)`
+        : `UPDATE users SET ${field} = COALESCE(${field}, 0) + ? WHERE LOWER(username) = LOWER(?)`;
+
+    db.run(query, [delta, username], function (err) {
+        if (err) return callback(err, false);
+        callback(null, this.changes > 0);
+    });
 }
 
 const authLimiter = rateLimit({
@@ -412,7 +453,7 @@ app.post('/api/register', authLimiter, async (req, res) => {
                                 }
                                 return res.status(500).json({ error: 'Database error: ' + insertErr.message });
                             }
-                            const token = jwt.sign({ id: this.lastID, username, role: 'user', activePackage: 'None', planActivated: 'false' }, jwtSecret, { expiresIn: '7d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
+                            const token = jwt.sign({ id: this.lastID, username, role: 'user', activePackage: 'None', planActivated: 'false' }, jwtSecret, { expiresIn: '30d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
                             res.json({
                                 success: true,
                                 message: 'Registration successful!',
@@ -423,7 +464,19 @@ app.post('/api/register', authLimiter, async (req, res) => {
                                     role: 'user',
                                     planActivated: 'false',
                                     status: 'active',
-                                    my_referral_id
+                                    my_referral_id,
+                                    balance: 0,
+                                    taskEarnings: 0,
+                                    daily_earnings: 0,
+                                    affiliate_balance: 0,
+                                    activePackage: 'None',
+                                    full_name: '',
+                                    phone: '',
+                                    bank_name: '',
+                                    bank_account_number: '',
+                                    bank_account_holder: '',
+                                    referred_by: referred_by || null,
+                                    created_at: new Date().toISOString()
                                 }
                             });
                         });
@@ -443,12 +496,12 @@ app.post('/api/login', authLimiter, async (req, res) => {
         readSiteSetting('maintenance_mode', 'false', (settingErr, maintenanceMode) => {
             if (settingErr) return res.status(500).json({ error: 'Failed to load site settings' });
             if (maintenanceMode === 'true') return res.status(503).json({ error: 'The platform is currently under maintenance.' });
-            db.get(`SELECT id, username, password, role, planActivated, activePackage, my_referral_id, status FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
+            db.get(`SELECT id, username, password, role, planActivated, activePackage, my_referral_id, status, balance, taskEarnings, daily_earnings, affiliate_balance FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
                 if (err || !user) return res.status(400).json({ error: 'Invalid username or password' });
                 if (user.status === 'banned') return res.status(403).json({ error: 'Your account has been suspended. Please contact support.' });
                 const passwordMatch = await bcryptjs.compare(password, user.password);
                 if (!passwordMatch) return res.status(400).json({ error: 'Invalid username or password' });
-                const token = jwt.sign({ id: user.id, username: user.username, role: user.role, activePackage: user.activePackage || 'None', planActivated: user.planActivated || 'false' }, jwtSecret, { expiresIn: '7d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
+                const token = jwt.sign({ id: user.id, username: user.username, role: user.role, activePackage: user.activePackage || 'None', planActivated: user.planActivated || 'false' }, jwtSecret, { expiresIn: '30d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
                 res.json({
                     success: true,
                     token,
@@ -459,7 +512,18 @@ app.post('/api/login', authLimiter, async (req, res) => {
                         planActivated: user.planActivated,
                         activePackage: user.activePackage,
                         status: user.status,
-                        my_referral_id: user.my_referral_id
+                        my_referral_id: user.my_referral_id,
+                        balance: user.balance || 0,
+                        taskEarnings: user.taskEarnings || 0,
+                        daily_earnings: user.daily_earnings || 0,
+                        affiliate_balance: user.affiliate_balance || 0,
+                        full_name: user.full_name || '',
+                        phone: user.phone || '',
+                        bank_name: user.bank_name || '',
+                        bank_account_number: user.bank_account_number || '',
+                        bank_account_holder: user.bank_account_holder || '',
+                        referred_by: user.referred_by || null,
+                        created_at: user.created_at || new Date().toISOString()
                     }
                 });
             });
@@ -510,14 +574,14 @@ app.get('/api/paystack/verify/:reference', authenticateToken, actionLimiter, asy
                 const paystackRes = await axios.get(`https://api.paystack.co/transaction/verify/${reference}`, { headers: { Authorization: `Bearer ${paystackSecret}` } });
                 const data = paystackRes.data.data;
                 if (data.status === 'success') {
-                    const amountPaid = data.amount / 100;
+                    const amountPaid = parseFloat((data.amount / 100).toFixed(2));
                     if (amountPaid < transaction.amount) return res.status(400).json({ error: "Amount paid is less than requested." });
                     db.run(`UPDATE paystack_transactions SET status = 'success' WHERE reference = ? AND status = 'pending'`, [reference], function (updateErr) {
                         if (updateErr) return res.status(500).json({ error: "Failed to update transaction status." });
                         if (this.changes === 0) return res.status(400).json({ error: "Transaction already processed." });
-                        db.run(`UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`, [transaction.amount, transaction.username], function (creditErr) {
+                        db.run(`UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`, [amountPaid, transaction.username], function (creditErr) {
                             if (creditErr) return res.status(500).json({ error: "Failed to credit user wallet." });
-                            res.json({ success: true, message: `Successfully deposited ₦${transaction.amount} into your wallet!` });
+                            res.json({ success: true, message: `Successfully deposited ₦${amountPaid} into your wallet!` });
                         });
                     });
                 } else {
@@ -550,8 +614,8 @@ app.post('/api/paystack/webhook', webhookLimiter, (req, res) => {
             if (amountPaid < transaction.amount) return;
             db.run(`UPDATE paystack_transactions SET status = 'success' WHERE reference = ? AND status = 'pending'`, [reference], function (updateErr) {
                 if (updateErr || this.changes === 0) return;
-                db.run(`UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`, [transaction.amount, transaction.username], (creditErr) => {
-                    if (!creditErr) console.log(`Webhook credited ₦${transaction.amount} to ${transaction.username}`);
+                db.run(`UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`, [amountPaid, transaction.username], (creditErr) => {
+                    if (!creditErr) console.log(`Webhook credited ₦${amountPaid} to ${transaction.username}`);
                 });
             });
         });
@@ -856,17 +920,10 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
         if (!username || !isValidAmount(amount)) {
             return res.status(400).json({ error: "Username and valid amount required" });
         }
-        let query = "";
-        const actionSign = action === 'subtract' ? '-' : '+';
-        switch (walletType) {
-            case 'taskEarnings': query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
-            case 'daily_earnings': query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
-            case 'affiliate_balance': query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
-            default: query = `UPDATE users SET balance = COALESCE(balance, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
-        }
-        db.run(query, [parseFloat(amount), username], function(err) {
+
+        applyWalletDelta(username, amount, walletType, action === 'subtract' ? 'subtract' : 'add', (err, updated) => {
             if (err) return res.status(500).json({ error: "Database error." });
-            if (this.changes === 0) return res.status(400).json({ error: "User not found" });
+            if (!updated) return res.status(400).json({ error: "User not found" });
             console.warn(`[ADMIN] ${action === 'subtract' ? 'Subtracted' : 'Added'} ₦${amount} to ${username}'s ${walletType || 'balance'} by ${req.user.username}`);
             res.json({ success: true, message: `Successfully ${action === 'subtract' ? 'subtracted' : 'added'} ₦${amount} to ${username}'s wallet!` });
         });
@@ -879,16 +936,10 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
 app.post('/api/admin/manual-credit', authenticateToken, adminOnly, (req, res) => {
     const { username, amount, walletType } = req.body;
     if (!username || !isValidAmount(amount)) return res.status(400).json({ error: "Username and valid amount required" });
-    let query = "";
-    switch (walletType) {
-        case 'taskEarnings': query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
-        case 'daily_earnings': query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
-        case 'affiliate_balance': query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
-        default: query = `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
-    }
-    db.run(query, [parseFloat(amount), username], function (err) {
+
+    applyWalletDelta(username, amount, walletType, 'add', (err, updated) => {
         if (err) return res.status(500).json({ error: "Database error." });
-        if (this.changes === 0) return res.status(400).json({ error: "User not found" });
+        if (!updated) return res.status(400).json({ error: "User not found" });
         console.warn(`[ADMIN] Manual credit of ₦${amount} to ${username}'s ${walletType || 'balance'} by ${req.user.username}`);
         res.json({ success: true, message: `Successfully credited ₦${amount} to ${username}'s wallet!` });
     });
