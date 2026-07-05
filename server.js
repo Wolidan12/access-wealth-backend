@@ -920,42 +920,17 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
         if (!username || !isValidAmount(amount)) {
             return res.status(400).json({ error: "Username and valid amount required" });
         }
-
         let query = "";
-        const normalizedWalletType = String(walletType || 'balance').trim().toLowerCase();
-        const operator = action === 'subtract' ? '-' : '+';
-        
-        switch (normalizedWalletType) {
-            case 'task':
-            case 'taskearnings':
-            case 'task_earnings':
-            case 'engagement':
-            case 'engagements':
-                query = `UPDATE users SET taskEarnings = CAST(COALESCE(taskEarnings, 0) AS REAL) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
-                break;
-            case 'daily':
-            case 'dailyearnings':
-            case 'daily_earnings':
-                query = `UPDATE users SET daily_earnings = CAST(COALESCE(daily_earnings, 0) AS REAL) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
-                break;
-            case 'affiliate':
-            case 'affiliatebalance':
-            case 'affiliate_balance':
-                query = `UPDATE users SET affiliate_balance = CAST(COALESCE(affiliate_balance, 0) AS REAL) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
-                break;
-            default:
-                query = `UPDATE users SET balance = CAST(COALESCE(balance, 0) AS REAL) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
-                break;
+        const actionSign = action === 'subtract' ? '-' : '+';
+        switch (walletType) {
+            case 'taskEarnings': query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
+            case 'daily_earnings': query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
+            case 'affiliate_balance': query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
+            default: query = `UPDATE users SET balance = COALESCE(balance, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
         }
-
-        db.run(query, [parseFloat(amount), username], function (err) {
-            if (err) {
-                console.error("Adjust balance error:", err.message);
-                return res.status(500).json({ error: "Database error: " + err.message });
-            }
-            if (this.changes === 0) {
-                return res.status(400).json({ error: "User not found" });
-            }
+        db.run(query, [parseFloat(amount), username], function(err) {
+            if (err) return res.status(500).json({ error: "Database error." });
+            if (this.changes === 0) return res.status(400).json({ error: "User not found" });
             console.warn(`[ADMIN] ${action === 'subtract' ? 'Subtracted' : 'Added'} ₦${amount} to ${username}'s ${walletType || 'balance'} by ${req.user.username}`);
             res.json({ success: true, message: `Successfully ${action === 'subtract' ? 'subtracted' : 'added'} ₦${amount} to ${username}'s wallet!` });
         });
@@ -964,50 +939,26 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
         res.status(500).json({ error: "Server error: " + error.message });
     }
 });
+});
 
 app.post('/api/admin/manual-credit', authenticateToken, adminOnly, (req, res) => {
     const { username, amount, walletType } = req.body;
-    if (!username || !isValidAmount(amount)) {
-        return res.status(400).json({ error: "Username and valid amount required" });
-    }
-
-    let query = "";
-    const normalizedWalletType = String(walletType || 'balance').trim().toLowerCase();
+    if (!username || !isValidAmount(amount)) return res.status(400).json({ error: "Username and valid amount required" });
     
-    switch (normalizedWalletType) {
-        case 'task':
-        case 'taskearnings':
-        case 'task_earnings':
-        case 'engagement':
-        case 'engagements':
-            query = `UPDATE users SET taskEarnings = CAST(COALESCE(taskEarnings, 0) AS REAL) + ? WHERE LOWER(username) = LOWER(?)`;
-            break;
-        case 'daily':
-        case 'dailyearnings':
-        case 'daily_earnings':
-            query = `UPDATE users SET daily_earnings = CAST(COALESCE(daily_earnings, 0) AS REAL) + ? WHERE LOWER(username) = LOWER(?)`;
-            break;
-        case 'affiliate':
-        case 'affiliatebalance':
-        case 'affiliate_balance':
-            query = `UPDATE users SET affiliate_balance = CAST(COALESCE(affiliate_balance, 0) AS REAL) + ? WHERE LOWER(username) = LOWER(?)`;
-            break;
-        default:
-            query = `UPDATE users SET balance = CAST(COALESCE(balance, 0) AS REAL) + ? WHERE LOWER(username) = LOWER(?)`;
-            break;
+    let query = "";
+    switch (walletType) {
+        case 'taskEarnings': query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
+        case 'daily_earnings': query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
+        case 'affiliate_balance': query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
+        default: query = `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
     }
-
     db.run(query, [parseFloat(amount), username], function (err) {
-        if (err) {
-            console.error('[MANUAL CREDIT] Database error:', err.message);
-            return res.status(500).json({ error: "Database error: " + err.message });
-        }
-        if (this.changes === 0) {
-            return res.status(400).json({ error: "User not found" });
-        }
+        if (err) return res.status(500).json({ error: "Database error." });
+        if (this.changes === 0) return res.status(400).json({ error: "User not found" });
         console.warn(`[ADMIN] Manual credit of ₦${amount} to ${username}'s ${walletType || 'balance'} by ${req.user.username}`);
         res.json({ success: true, message: `Successfully credited ₦${amount} to ${username}'s wallet!` });
     });
+});
 });
 
 app.get('/api/admin/users', authenticateToken, adminOnly, (req, res) => {
