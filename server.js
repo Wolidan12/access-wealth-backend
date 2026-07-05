@@ -438,11 +438,25 @@ app.post('/api/register', authLimiter, async (req, res) => {
                     }
                     if (existing) return res.status(400).json({ error: 'Username already taken. Please choose another.' });
 
+                    // Validate referral code if provided
+                    let validReferrer = null;
+                    if (referred_by) {
+                        const referrerCheck = await new Promise((resolve) => {
+                            db.get(`SELECT my_referral_id FROM users WHERE my_referral_id = ?`, [referred_by], (err, row) => {
+                                resolve(err ? null : row);
+                            });
+                        });
+                        if (!referrerCheck) {
+                            return res.status(400).json({ error: 'Invalid referral code' });
+                        }
+                        validReferrer = referred_by;
+                    }
+
                     const my_referral_id = 'AW' + crypto.randomBytes(4).toString('hex').toUpperCase();
                     const hashedPassword = await bcryptjs.hash(password, 10);
 
                     db.run(`INSERT INTO users (username, password, my_referral_id, referred_by, role, status, balance, taskEarnings, daily_earnings, affiliate_balance) VALUES (?, ?, ?, ?, 'user', 'active', 0, 0, 0, 0)`,
-                        [username, hashedPassword, my_referral_id, referred_by || null], function (insertErr) {
+                        [username, hashedPassword, my_referral_id, validReferrer || null], function (insertErr) {
                             if (insertErr) {
                                 console.error('Registration insert error:', insertErr.message);
                                 if (insertErr.message.includes('UNIQUE constraint failed: users.username')) {
@@ -654,8 +668,12 @@ app.post('/api/activate', authenticateToken, actionLimiter, (req, res) => {
             [newBalance, newDailyEarnings, req.body.name, req.user.id], function (updateErr) {
                 if (updateErr) return res.status(500).json({ error: "Database error." });
                 if (this.changes === 0) return res.status(400).json({ error: "Plan already activated or balance insufficient." });
+                // Award referral bonus to referrer if user was referred by a valid code
                 if (user.referred_by) {
-                    db.run(`UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) + ? WHERE my_referral_id = ?`, [plan.referral, user.referred_by]);
+                    db.run(`UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) + ? WHERE my_referral_id = ?`, [plan.referral, user.referred_by], function(bonusErr) {
+                        if (bonusErr) console.error('[REFERRAL] Error awarding bonus:', bonusErr);
+                        else console.warn(`[REFERRAL] Awarded ₦${plan.referral} to referrer for ${user.username}'s activation`);
+                    });
                 }
                 res.json({ success: true, newBalance });
             });
@@ -1056,9 +1074,11 @@ app.get('/api/referral/stats/:username', authenticateToken, (req, res) => {
     db.get(`SELECT my_referral_id, affiliate_balance FROM users WHERE LOWER(username) = LOWER(?)`, [username], (err, user) => {
         if (err || !user) return res.status(404).json({ error: "User not found" });
         const myRefId = user.my_referral_id;
-        db.get(`SELECT COUNT(*) as count FROM users WHERE referred_by = ?`, [myRefId], (err2, stats) => {
+        // Count only ACTIVATED referrals (users who purchased a plan)
+        db.get(`SELECT COUNT(*) as count FROM users WHERE referred_by = ? AND planActivated = 'true'`, [myRefId], (err2, stats) => {
             if (err2) return res.status(500).json({ error: "Database error" });
-            db.all(`SELECT username, created_at, planActivated FROM users WHERE referred_by = ? ORDER BY created_at DESC`, [myRefId], (err3, referrals) => {
+            // Get all activated referrals with their details
+            db.all(`SELECT username, created_at, planActivated, activePackage FROM users WHERE referred_by = ? AND planActivated = 'true' ORDER BY created_at DESC`, [myRefId], (err3, referrals) => {
                 res.json({ success: true, totalReferrals: stats.count || 0, earnings: user.affiliate_balance || 0, referrals: referrals || [] });
             });
         });
@@ -1066,7 +1086,8 @@ app.get('/api/referral/stats/:username', authenticateToken, (req, res) => {
 });
 
 app.get('/api/referral/leaderboard', (req, res) => {
-    db.all(`SELECT username, affiliate_balance as total_earned, (SELECT COUNT(*) FROM users WHERE referred_by = u.my_referral_id) as referral_count FROM users u WHERE role = 'user' ORDER BY affiliate_balance DESC LIMIT 10`, [], (err, rows) => {
+    // Show only activated referrals count (users who purchased plans)
+    db.all(`SELECT username, affiliate_balance as total_earned, (SELECT COUNT(*) FROM users WHERE referred_by = u.my_referral_id AND planActivated = 'true') as referral_count FROM users u WHERE role = 'user' ORDER BY affiliate_balance DESC LIMIT 10`, [], (err, rows) => {
         if (err) return res.status(500).json({ error: "Database error" });
         res.json({ success: true, leaderboard: rows || [] });
     });
