@@ -921,9 +921,41 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
             return res.status(400).json({ error: "Username and valid amount required" });
         }
 
-        applyWalletDelta(username, amount, walletType, action === 'subtract' ? 'subtract' : 'add', (err, updated) => {
-            if (err) return res.status(500).json({ error: "Database error." });
-            if (!updated) return res.status(400).json({ error: "User not found" });
+        let query = "";
+        const normalizedWalletType = String(walletType || 'balance').trim().toLowerCase();
+        const operator = action === 'subtract' ? '-' : '+';
+        
+        switch (normalizedWalletType) {
+            case 'task':
+            case 'taskearnings':
+            case 'task_earnings':
+            case 'engagement':
+            case 'engagements':
+                query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
+                break;
+            case 'daily':
+            case 'dailyearnings':
+            case 'daily_earnings':
+                query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
+                break;
+            case 'affiliate':
+            case 'affiliatebalance':
+            case 'affiliate_balance':
+                query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
+                break;
+            default:
+                query = `UPDATE users SET balance = COALESCE(balance, 0) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
+                break;
+        }
+
+        db.run(query, [parseFloat(amount), username], function (err) {
+            if (err) {
+                console.error("Adjust balance error:", err.message);
+                return res.status(500).json({ error: "Database error: " + err.message });
+            }
+            if (this.changes === 0) {
+                return res.status(400).json({ error: "User not found" });
+            }
             console.warn(`[ADMIN] ${action === 'subtract' ? 'Subtracted' : 'Added'} ₦${amount} to ${username}'s ${walletType || 'balance'} by ${req.user.username}`);
             res.json({ success: true, message: `Successfully ${action === 'subtract' ? 'subtracted' : 'added'} ₦${amount} to ${username}'s wallet!` });
         });
@@ -935,19 +967,42 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
 
 app.post('/api/admin/manual-credit', authenticateToken, adminOnly, (req, res) => {
     const { username, amount, walletType } = req.body;
-    console.log('[MANUAL CREDIT] Request received:', { username, amount, walletType, adminUsername: req.user?.username });
     if (!username || !isValidAmount(amount)) {
-        console.warn('[MANUAL CREDIT] Validation failed:', { username, amount, valid: isValidAmount(amount) });
         return res.status(400).json({ error: "Username and valid amount required" });
     }
 
-    applyWalletDelta(username, amount, walletType, 'add', (err, updated) => {
+    let query = "";
+    const normalizedWalletType = String(walletType || 'balance').trim().toLowerCase();
+    
+    switch (normalizedWalletType) {
+        case 'task':
+        case 'taskearnings':
+        case 'task_earnings':
+        case 'engagement':
+        case 'engagements':
+            query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) + ? WHERE LOWER(username) = LOWER(?)`;
+            break;
+        case 'daily':
+        case 'dailyearnings':
+        case 'daily_earnings':
+            query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) + ? WHERE LOWER(username) = LOWER(?)`;
+            break;
+        case 'affiliate':
+        case 'affiliatebalance':
+        case 'affiliate_balance':
+            query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) + ? WHERE LOWER(username) = LOWER(?)`;
+            break;
+        default:
+            query = `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`;
+            break;
+    }
+
+    db.run(query, [parseFloat(amount), username], function (err) {
         if (err) {
             console.error('[MANUAL CREDIT] Database error:', err.message);
             return res.status(500).json({ error: "Database error: " + err.message });
         }
-        if (!updated) {
-            console.warn('[MANUAL CREDIT] User not found:', username);
+        if (this.changes === 0) {
             return res.status(400).json({ error: "User not found" });
         }
         console.warn(`[ADMIN] Manual credit of ₦${amount} to ${username}'s ${walletType || 'balance'} by ${req.user.username}`);
