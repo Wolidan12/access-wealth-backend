@@ -939,7 +939,6 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
         res.status(500).json({ error: "Server error: " + error.message });
     }
 });
-});
 
 app.post('/api/admin/manual-credit', authenticateToken, adminOnly, (req, res) => {
     const { username, amount, walletType } = req.body;
@@ -985,7 +984,6 @@ app.post('/api/admin/manual-credit', authenticateToken, adminOnly, (req, res) =>
             });
         });
     });
-});
 });
 
 app.get('/api/admin/users', authenticateToken, adminOnly, (req, res) => {
