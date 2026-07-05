@@ -9,6 +9,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
+const paystackService = require('./services/paystackService');
 
 const app = express();
 const jwtSecret = process.env.JWT_SECRET || 'dev-jwt-secret-change-me';
@@ -754,20 +755,147 @@ app.get('/api/admin/all-withdrawals', authenticateToken, adminOnly, (req, res) =
     });
 });
 
-app.post('/api/admin/approve-withdrawal', authenticateToken, adminOnly, (req, res) => {
+app.post('/api/admin/approve-withdrawal', authenticateToken, adminOnly, async (req, res) => {
     const { id, note } = req.body;
     if (!id) return res.status(400).json({ error: "Withdrawal ID required" });
-    db.get(`SELECT * FROM withdrawals WHERE id = ? AND status = 'pending'`, [id], (err, withdrawal) => {
-        if (err || !withdrawal) return res.status(404).json({ error: "Withdrawal not found or already processed" });
-        db.run(`UPDATE withdrawals SET status = 'approved', admin_note = ?, reviewed_by = ?, reviewed_at = datetime('now') 
-                WHERE id = ? AND status = 'pending'`,
-                [note || 'Your withdrawal has been approved. Money is on the way!', req.user.username, id], function(updateErr) {
-            if (updateErr) return res.status(500).json({ error: "Database error" });
-            if (this.changes === 0) return res.status(400).json({ error: "Withdrawal already processed" });
-            console.warn(`[ADMIN] Withdrawal ${id} approved by ${req.user.username}`);
-            res.json({ success: true, message: "Withdrawal approved!" });
+    
+    try {
+        // Step 1: Fetch withdrawal (must be pending to proceed)
+        const withdrawal = await new Promise((resolve, reject) => {
+            db.get(`SELECT * FROM withdrawals WHERE id = ? AND status = 'pending'`, [id], (err, row) => {
+                if (err) reject(err);
+                else resolve(row);
+            });
         });
-    });
+
+        if (!withdrawal) {
+            return res.status(404).json({ error: "Withdrawal not found or already processed" });
+        }
+
+        console.log(`[WITHDRAWAL] Processing approval for withdrawal ${id} by ${req.user.username}`);
+
+        // Step 2: Fetch user's bank details
+        const user = await new Promise((resolve, reject) => {
+            db.get(`SELECT bank_name, bank_account_number, bank_account_holder, bank_code, 
+                           paystack_recipient_code, paystack_recipient_id 
+                    FROM users WHERE LOWER(username) = LOWER(?)`, 
+                [withdrawal.username], (err, row) => {
+                if (err) reject(err);
+                else resolve(row);
+            });
+        });
+
+        if (!user) {
+            return res.status(404).json({ error: "User not found" });
+        }
+
+        // Validate user has complete bank details
+        if (!user.bank_account_number || !user.bank_account_holder || !user.bank_code) {
+            return res.status(400).json({ 
+                error: "User has incomplete bank details. Cannot process transfer." 
+            });
+        }
+
+        console.log(`[WITHDRAWAL] User bank details verified for ${withdrawal.username}`);
+
+        // Step 3: Create or reuse Paystack recipient
+        let recipient_code = user.paystack_recipient_code;
+        
+        if (!recipient_code) {
+            console.log(`[WITHDRAWAL] Creating new Paystack recipient for ${withdrawal.username}`);
+            const recipientResult = await paystackService.createPaystackRecipient(
+                user.bank_code,
+                user.bank_account_number,
+                user.bank_account_holder
+            );
+
+            if (!recipientResult.success) {
+                console.error(`[WITHDRAWAL] Failed to create recipient:`, recipientResult.error);
+                return res.status(400).json({ 
+                    error: "Failed to create Paystack recipient: " + recipientResult.error 
+                });
+            }
+
+            recipient_code = recipientResult.recipient_code;
+
+            // Save recipient code to user for future use
+            await new Promise((resolve, reject) => {
+                db.run(`UPDATE users SET paystack_recipient_code = ?, paystack_recipient_id = ? 
+                        WHERE LOWER(username) = LOWER(?)`,
+                    [recipient_code, recipientResult.recipient_id, withdrawal.username],
+                    (err) => {
+                        if (err) reject(err);
+                        else resolve();
+                    }
+                );
+            });
+
+            console.log(`[WITHDRAWAL] Recipient code saved: ${recipient_code}`);
+        } else {
+            console.log(`[WITHDRAWAL] Reusing existing Paystack recipient: ${recipient_code}`);
+        }
+
+        // Step 4: Initiate Paystack transfer
+        console.log(`[WITHDRAWAL] Initiating transfer: ${withdrawal.amount} NGN to ${recipient_code}`);
+        const transferResult = await paystackService.initiatePaystackTransfer(
+            recipient_code,
+            withdrawal.amount,
+            `Withdrawal to ${user.bank_account_holder} (Acct: ${user.bank_account_number})`
+        );
+
+        if (!transferResult.success) {
+            console.error(`[WITHDRAWAL] Transfer initiation failed:`, transferResult.error);
+            return res.status(400).json({ 
+                error: "Failed to initiate Paystack transfer: " + transferResult.error 
+            });
+        }
+
+        console.log(`[WITHDRAWAL] Transfer initiated: ${transferResult.reference}`);
+
+        // Step 5: Update withdrawal status to 'processing' with transfer reference (using transaction)
+        await new Promise((resolve, reject) => {
+            db.serialize(() => {
+                db.run('BEGIN TRANSACTION');
+                
+                db.run(`UPDATE withdrawals 
+                        SET status = 'processing', 
+                            admin_note = ?, 
+                            reviewed_by = ?, 
+                            reviewed_at = datetime('now'),
+                            paystack_transfer_reference = ?,
+                            paystack_transfer_date = datetime('now')
+                        WHERE id = ? AND status = 'pending'`,
+                    [note || 'Processing Paystack transfer', req.user.username, transferResult.reference, id],
+                    function(err) {
+                        if (err) {
+                            db.run('ROLLBACK');
+                            reject(err);
+                        } else if (this.changes === 0) {
+                            db.run('ROLLBACK');
+                            reject(new Error('Withdrawal status changed unexpectedly'));
+                        } else {
+                            db.run('COMMIT', (commitErr) => {
+                                if (commitErr) reject(commitErr);
+                                else resolve();
+                            });
+                        }
+                    }
+                );
+            });
+        });
+
+        console.warn(`[ADMIN] Withdrawal ${id} approved and processing by ${req.user.username}`);
+        
+        res.json({ 
+            success: true, 
+            message: "Withdrawal approved! Transfer initiated to Paystack.",
+            transfer_reference: transferResult.reference
+        });
+
+    } catch (error) {
+        console.error(`[WITHDRAWAL] Error processing approval:`, error);
+        res.status(500).json({ error: "Server error: " + error.message });
+    }
 });
 
 app.post('/api/admin/decline-withdrawal', authenticateToken, adminOnly, (req, res) => {
