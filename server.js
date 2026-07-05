@@ -441,7 +441,7 @@ app.post('/api/register', authLimiter, async (req, res) => {
                     const my_referral_id = 'AW' + crypto.randomBytes(4).toString('hex').toUpperCase();
                     const hashedPassword = await bcryptjs.hash(password, 10);
 
-                    db.run(`INSERT INTO users (username, password, my_referral_id, referred_by, role, status) VALUES (?, ?, ?, ?, 'user', 'active')`,
+                    db.run(`INSERT INTO users (username, password, my_referral_id, referred_by, role, status, balance, taskEarnings, daily_earnings, affiliate_balance) VALUES (?, ?, ?, ?, 'user', 'active', 0, 0, 0, 0)`,
                         [username, hashedPassword, my_referral_id, referred_by || null], function (insertErr) {
                             if (insertErr) {
                                 console.error('Registration insert error:', insertErr.message);
@@ -931,20 +931,20 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
             case 'task_earnings':
             case 'engagement':
             case 'engagements':
-                query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
+                query = `UPDATE users SET taskEarnings = CAST(COALESCE(taskEarnings, 0) AS REAL) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
                 break;
             case 'daily':
             case 'dailyearnings':
             case 'daily_earnings':
-                query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
+                query = `UPDATE users SET daily_earnings = CAST(COALESCE(daily_earnings, 0) AS REAL) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
                 break;
             case 'affiliate':
             case 'affiliatebalance':
             case 'affiliate_balance':
-                query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
+                query = `UPDATE users SET affiliate_balance = CAST(COALESCE(affiliate_balance, 0) AS REAL) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
                 break;
             default:
-                query = `UPDATE users SET balance = COALESCE(balance, 0) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
+                query = `UPDATE users SET balance = CAST(COALESCE(balance, 0) AS REAL) ${operator} ? WHERE LOWER(username) = LOWER(?)`;
                 break;
         }
 
@@ -980,20 +980,20 @@ app.post('/api/admin/manual-credit', authenticateToken, adminOnly, (req, res) =>
         case 'task_earnings':
         case 'engagement':
         case 'engagements':
-            query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) + ? WHERE LOWER(username) = LOWER(?)`;
+            query = `UPDATE users SET taskEarnings = CAST(COALESCE(taskEarnings, 0) AS REAL) + ? WHERE LOWER(username) = LOWER(?)`;
             break;
         case 'daily':
         case 'dailyearnings':
         case 'daily_earnings':
-            query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) + ? WHERE LOWER(username) = LOWER(?)`;
+            query = `UPDATE users SET daily_earnings = CAST(COALESCE(daily_earnings, 0) AS REAL) + ? WHERE LOWER(username) = LOWER(?)`;
             break;
         case 'affiliate':
         case 'affiliatebalance':
         case 'affiliate_balance':
-            query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) + ? WHERE LOWER(username) = LOWER(?)`;
+            query = `UPDATE users SET affiliate_balance = CAST(COALESCE(affiliate_balance, 0) AS REAL) + ? WHERE LOWER(username) = LOWER(?)`;
             break;
         default:
-            query = `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`;
+            query = `UPDATE users SET balance = CAST(COALESCE(balance, 0) AS REAL) + ? WHERE LOWER(username) = LOWER(?)`;
             break;
     }
 
