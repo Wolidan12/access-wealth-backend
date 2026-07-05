@@ -652,6 +652,195 @@ app.post('/api/paystack/webhook', webhookLimiter, (req, res) => {
 });
 
 // ==========================================
+// PAYSTACK TRANSFER WEBHOOK - Handles withdrawal completion
+// ==========================================
+/**
+ * Paystack Transfer Webhook
+ * 
+ * Listens for transfer events from Paystack:
+ * - transfer.success: Money successfully sent to user's bank
+ * - transfer.failed: Transfer attempt failed
+ * - transfer.reversed: Money was reversed (e.g., wrong account)
+ * 
+ * Flow:
+ * 1. Verify webhook signature using HMAC-SHA512
+ * 2. Find the withdrawal by Paystack reference
+ * 3. Update status based on transfer result
+ * 4. Auto-refund on failure/reversal
+ * 5. Use transaction to ensure consistency
+ */
+app.post('/api/paystack/transfer-webhook', webhookLimiter, (req, res) => {
+    // Step 1: Verify signature (security - ensure it's really from Paystack)
+    const signature = req.headers['x-paystack-signature'];
+    if (!signature) {
+        console.warn('[TRANSFER WEBHOOK] Missing signature header');
+        return res.status(400).send('Missing signature');
+    }
+
+    // Verify using paystackService
+    if (!paystackService.verifyPaystackWebhookSignature(req.rawBody, signature)) {
+        console.warn('[TRANSFER WEBHOOK] Invalid signature');
+        return res.status(400).send('Invalid signature');
+    }
+
+    // Respond immediately to Paystack (acknowledge receipt)
+    res.sendStatus(200);
+
+    // Step 2: Parse the event
+    const event = req.body;
+    console.log(`[TRANSFER WEBHOOK] Received event: ${event.event}`);
+
+    // Only process transfer events
+    if (!event.event.startsWith('transfer.')) {
+        console.log('[TRANSFER WEBHOOK] Ignoring non-transfer event');
+        return;
+    }
+
+    const eventData = paystackService.parseTransferEvent(event);
+    if (!eventData) {
+        console.error('[TRANSFER WEBHOOK] Failed to parse event');
+        return;
+    }
+
+    const { reference, status, amount, event_type, reason, failures } = eventData;
+
+    // Step 3: Find withdrawal by Paystack reference
+    db.get(
+        `SELECT w.*, u.balance, u.taskEarnings, u.daily_earnings, u.affiliate_balance 
+         FROM withdrawals w 
+         JOIN users u ON w.username = u.username 
+         WHERE w.paystack_transfer_reference = ?`,
+        [reference],
+        (err, withdrawal) => {
+            if (err || !withdrawal) {
+                console.error(`[TRANSFER WEBHOOK] Withdrawal not found for reference ${reference}`);
+                return;
+            }
+
+            console.log(`[TRANSFER WEBHOOK] Processing ${event_type} for withdrawal ${withdrawal.id}`);
+
+            // Step 4: Handle different transfer statuses
+            if (event_type === 'transfer.success') {
+                // Success: Update status to 'success'
+                handleTransferSuccess(withdrawal, amount, reference);
+            } else if (event_type === 'transfer.failed' || event_type === 'transfer.reversed') {
+                // Failure/Reversal: Update status to 'failed' and refund user
+                handleTransferFailure(withdrawal, event_type, failures, reference);
+            }
+        }
+    );
+});
+
+/**
+ * Handle successful transfer
+ * Updates withdrawal status to 'success'
+ */
+function handleTransferSuccess(withdrawal, amount, reference) {
+    db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+
+        // Update withdrawal status to success
+        db.run(
+            `UPDATE withdrawals 
+             SET status = 'success'
+             WHERE paystack_transfer_reference = ? AND status = 'processing'`,
+            [reference],
+            function(err) {
+                if (err) {
+                    console.error('[TRANSFER SUCCESS] Error updating withdrawal:', err);
+                    db.run('ROLLBACK');
+                    return;
+                }
+
+                if (this.changes === 0) {
+                    console.warn('[TRANSFER SUCCESS] Withdrawal already updated (prevented duplicate)');
+                    db.run('ROLLBACK');
+                    return;
+                }
+
+                // Commit transaction
+                db.run('COMMIT', (commitErr) => {
+                    if (commitErr) {
+                        console.error('[TRANSFER SUCCESS] Commit error:', commitErr);
+                    } else {
+                        console.warn(`[TRANSFER SUCCESS] Withdrawal ${withdrawal.id} completed! ₦${amount} transferred`);
+                    }
+                });
+            }
+        );
+    });
+}
+
+/**
+ * Handle failed or reversed transfer
+ * Updates withdrawal status to 'failed' and refunds user's wallet
+ */
+function handleTransferFailure(withdrawal, event_type, failures, reference) {
+    const reason = failures ? JSON.stringify(failures) : 'Unknown error';
+
+    db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+
+        // Step 1: Determine which wallet field to refund
+        let walletField = 'balance';
+        if (withdrawal.wallet_type === 'affiliate') {
+            walletField = 'affiliate_balance';
+        } else if (withdrawal.wallet_type === 'task') {
+            walletField = 'taskEarnings';
+        }
+
+        // Step 2: Refund the user's wallet
+        db.run(
+            `UPDATE users 
+             SET ${walletField} = ${walletField} + ? 
+             WHERE LOWER(username) = LOWER(?)`,
+            [withdrawal.amount, withdrawal.username],
+            (refundErr) => {
+                if (refundErr) {
+                    console.error('[TRANSFER FAILURE] Error refunding user:', refundErr);
+                    db.run('ROLLBACK');
+                    return;
+                }
+
+                // Step 3: Update withdrawal status to failed with reason
+                db.run(
+                    `UPDATE withdrawals 
+                     SET status = 'failed', 
+                         paystack_failure_reason = ?
+                     WHERE paystack_transfer_reference = ? AND status = 'processing'`,
+                    [reason, reference],
+                    function(err) {
+                        if (err) {
+                            console.error('[TRANSFER FAILURE] Error updating withdrawal:', err);
+                            db.run('ROLLBACK');
+                            return;
+                        }
+
+                        if (this.changes === 0) {
+                            console.warn('[TRANSFER FAILURE] Withdrawal already updated (prevented duplicate)');
+                            db.run('ROLLBACK');
+                            return;
+                        }
+
+                        // Commit transaction (refund + status update atomic)
+                        db.run('COMMIT', (commitErr) => {
+                            if (commitErr) {
+                                console.error('[TRANSFER FAILURE] Commit error:', commitErr);
+                            } else {
+                                console.warn(
+                                    `[TRANSFER FAILURE] Withdrawal ${withdrawal.id} failed (${event_type}). ` +
+                                    `Refunded ₦${withdrawal.amount} to ${withdrawal.username}. Reason: ${reason}`
+                                );
+                            }
+                        });
+                    }
+                );
+            }
+        );
+    });
+}
+
+// ==========================================
 // 3. SUBSCRIPTION PLANS (All 13 Tiers)
 // ==========================================
 const planRewards = {
