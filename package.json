@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "migrate:legacy-plans": "node scripts/migrate-legacy-plans.js"
   },
   "keywords": [],
   "author": "",
