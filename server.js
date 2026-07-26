@@ -15,9 +15,12 @@ const app = express();
 const jwtSecret = process.env.JWT_SECRET || 'dev-jwt-secret-change-me';
 const paystackSecret = process.env.PAYSTACK_SECRET_KEY || 'dev-paystack-secret';
 
-if (!process.env.JWT_SECRET || !process.env.SQUAD_SECRET_KEY) {
-    console.error("FATAL ERROR: JWT_SECRET or SQUAD_SECRET_KEY is missing.");
-    process.exit(1);
+if (!process.env.JWT_SECRET) {
+    console.warn('WARN: JWT_SECRET is missing. Using development fallback secret. Set JWT_SECRET in production.');
+}
+
+if (!process.env.SQUAD_SECRET_KEY) {
+    console.warn('WARN: SQUAD_SECRET_KEY is missing. Squad deposit and webhook endpoints will be unavailable.');
 }
 
 app.set('trust proxy', 1);
@@ -58,6 +61,12 @@ function isValidEmail(email) {
 
 function getSquadApiUrl() {
     return process.env.SQUAD_API_URL || process.env.SQUAD_BASE_URL || 'https://sandbox-api-d.squadco.com';
+}
+
+function ensureSquadConfigured(res) {
+    if (process.env.SQUAD_SECRET_KEY) return true;
+    res.status(503).json({ error: 'Squad gateway is not configured on the server.' });
+    return false;
 }
 
 function isSquadWebhookSignatureValid(req) {
@@ -700,6 +709,8 @@ app.post('/api/login', authLimiter, async (req, res) => {
 
 async function createSquadDepositLink(req, res) {
     try {
+        if (!ensureSquadConfigured(res)) return;
+
         const { amount, email, user_id } = req.body;
         if (!isValidAmount(amount) || !isValidEmail(email) || !user_id) return res.status(400).json({ error: "Amount, email, and user_id are required" });
         if (Number(user_id) !== Number(req.user.id)) {
@@ -771,6 +782,10 @@ app.post('/api/squad/payment-link', authenticateToken, actionLimiter, createSqua
 
 app.post('/api/squad/webhook', webhookLimiter, async (req, res) => {
     try {
+        if (!process.env.SQUAD_SECRET_KEY) {
+            return res.status(503).send('Squad gateway is not configured.');
+        }
+
         if (!isSquadWebhookSignatureValid(req)) {
             console.warn(`Invalid Squad webhook signature from ${req.ip}`);
             return res.status(401).send('Unauthorized');
