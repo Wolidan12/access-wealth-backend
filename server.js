@@ -9,14 +9,12 @@ const axios = require('axios');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
-const paystackService = require('./services/paystackService');
 
 const app = express();
-const jwtSecret = process.env.JWT_SECRET || 'dev-jwt-secret-change-me';
-const paystackSecret = process.env.PAYSTACK_SECRET_KEY || 'dev-paystack-secret';
+const jwtSecret = process.env.JWT_SECRET;
 
-if (!process.env.JWT_SECRET) {
-    console.warn('WARN: JWT_SECRET is missing. Using development fallback secret. Set JWT_SECRET in production.');
+if (!jwtSecret) {
+    throw new Error('JWT_SECRET must be configured before the server can start.');
 }
 
 if (!process.env.SQUAD_SECRET_KEY) {
@@ -233,9 +231,6 @@ db.serialize(() => {
         { name: 'bank_account_number', type: 'TEXT' },
         { name: 'bank_account_holder', type: 'TEXT' },
         { name: 'bank_code', type: 'TEXT' },
-        // Paystack recipient information - stored to avoid creating duplicate recipients
-        { name: 'paystack_recipient_code', type: 'TEXT' },
-        { name: 'paystack_recipient_id', type: 'TEXT' },
         { name: 'created_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' },
         { name: 'status', type: 'TEXT DEFAULT \'active\'' }
     ];
@@ -302,16 +297,6 @@ db.serialize(() => {
         if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
     });
     db.run(`ALTER TABLE withdrawals ADD COLUMN reviewed_at DATETIME`, (err) => {
-        if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
-    });
-    // Add Paystack transfer tracking columns
-    db.run(`ALTER TABLE withdrawals ADD COLUMN paystack_transfer_reference TEXT`, (err) => {
-        if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
-    });
-    db.run(`ALTER TABLE withdrawals ADD COLUMN paystack_transfer_date DATETIME`, (err) => {
-        if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
-    });
-    db.run(`ALTER TABLE withdrawals ADD COLUMN paystack_failure_reason TEXT`, (err) => {
         if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
     });
 
@@ -632,7 +617,7 @@ app.post('/api/register', authLimiter, async (req, res) => {
                             }
                             return res.status(500).json({ error: "Database error: " + err.message });
                         }
-                        const token = jwt.sign({ id: this.lastID, username, role: 'user' }, process.env.JWT_SECRET, { expiresIn: '7d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
+                        const token = jwt.sign({ id: this.lastID, username, role: 'user' }, jwtSecret, { expiresIn: '7d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
                         res.json({
                             success: true,
                             message: "Registration successful!",
@@ -685,7 +670,7 @@ app.post('/api/login', authLimiter, async (req, res) => {
             if (err || !user) return res.status(400).json({ error: "Invalid username or password" });
             const passwordMatch = await bcryptjs.compare(password, user.password);
             if (!passwordMatch) return res.status(400).json({ error: "Invalid username or password" });
-            const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, process.env.JWT_SECRET, { expiresIn: '7d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
+            const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, jwtSecret, { expiresIn: '7d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
             res.json({
                 success: true,
                 token,
@@ -780,6 +765,35 @@ async function createSquadDepositLink(req, res) {
 app.post('/api/deposit', authenticateToken, actionLimiter, createSquadDepositLink);
 app.post('/api/squad/payment-link', authenticateToken, actionLimiter, createSquadDepositLink);
 
+app.get('/api/squad/transaction/:reference', authenticateToken, async (req, res) => {
+    const reference = (req.params.reference || '').trim();
+    if (!reference) return res.status(400).json({ error: 'Transaction reference is required.' });
+
+    try {
+        const transaction = await dbGetAsync(
+            `SELECT reference, amount, status, provider_reference, processed_at, created_at
+             FROM squad_transactions
+             WHERE reference = ? AND (LOWER(username) = LOWER(?) OR ? = 'admin')`,
+            [reference, req.user.username, req.user.role]
+        );
+
+        if (!transaction) return res.status(404).json({ error: 'Transaction not found.' });
+
+        const status = (transaction.status || 'pending').toLowerCase();
+        return res.json({
+            success: status === 'success',
+            status,
+            message: status === 'success'
+                ? 'Deposit credited successfully.'
+                : 'Your payment is still awaiting confirmation.',
+            transaction
+        });
+    } catch (error) {
+        console.error('Squad transaction lookup error:', error.message);
+        return res.status(500).json({ error: 'Unable to retrieve transaction status.' });
+    }
+});
+
 app.post('/api/squad/webhook', webhookLimiter, async (req, res) => {
     try {
         if (!process.env.SQUAD_SECRET_KEY) {
@@ -817,32 +831,35 @@ app.post('/api/squad/webhook', webhookLimiter, async (req, res) => {
         if (!Number.isFinite(paidAmount) || paidAmount <= 0) {
             return res.status(400).json({ error: 'Invalid amount in webhook payload.' });
         }
-
-        const updateTx = await dbRunAsync(
-            `UPDATE squad_transactions
-             SET status = 'success', provider_reference = COALESCE(?, provider_reference), payload = ?, processed_at = datetime('now')
-             WHERE reference = ? AND status = 'pending'`,
-            [
-                (data.transaction_ref || data.reference || null),
-                JSON.stringify(event),
-                reference
-            ]
-        );
-
-        if (!updateTx.changes) {
-            return res.sendStatus(200);
+        if (Math.round(paidAmount * 100) !== Math.round(Number(transaction.amount) * 100)) {
+            console.warn(`Squad webhook amount mismatch for ${reference}`);
+            return res.status(400).json({ error: 'Webhook amount does not match the initiated transaction.' });
         }
 
-        const creditResult = await dbRunAsync(
-            `UPDATE users
-             SET wallet_balance = COALESCE(wallet_balance, balance, 0) + ?,
-                 balance = COALESCE(balance, 0) + ?
-             WHERE LOWER(username) = LOWER(?) OR id = ?`,
-            [paidAmount, paidAmount, transaction.username, transaction.user_id || 0]
-        );
+        await dbRunAsync('BEGIN IMMEDIATE TRANSACTION');
+        try {
+            const updateTx = await dbRunAsync(
+                `UPDATE squad_transactions
+                 SET status = 'success', provider_reference = COALESCE(?, provider_reference), payload = ?, processed_at = datetime('now')
+                 WHERE reference = ? AND status = 'pending'`,
+                [(data.transaction_ref || data.reference || null), JSON.stringify(event), reference]
+            );
 
-        if (!creditResult.changes) {
-            return res.status(404).json({ error: 'User not found for credited transaction.' });
+            if (!updateTx.changes) {
+                await dbRunAsync('ROLLBACK');
+                return res.sendStatus(200);
+            }
+
+            const creditResult = await dbRunAsync(
+                `UPDATE users SET wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE id = ?`,
+                [paidAmount, transaction.user_id]
+            );
+            if (!creditResult.changes) throw new Error('User not found for credited transaction.');
+
+            await dbRunAsync('COMMIT');
+        } catch (creditError) {
+            try { await dbRunAsync('ROLLBACK'); } catch (_) {}
+            throw creditError;
         }
 
         return res.sendStatus(200);
@@ -1080,144 +1097,20 @@ app.get('/api/admin/all-withdrawals', authenticateToken, adminOnly, (req, res) =
 
 app.post('/api/admin/approve-withdrawal', authenticateToken, adminOnly, async (req, res) => {
     const { id, note } = req.body;
-    if (!id) return res.status(400).json({ error: "Withdrawal ID required" });
-    
+    if (!id) return res.status(400).json({ error: 'Withdrawal ID required' });
+
     try {
-        // Step 1: Fetch withdrawal (must be pending to proceed)
-        const withdrawal = await new Promise((resolve, reject) => {
-            db.get(`SELECT * FROM withdrawals WHERE id = ? AND status = 'pending'`, [id], (err, row) => {
-                if (err) reject(err);
-                else resolve(row);
-            });
-        });
-
-        if (!withdrawal) {
-            return res.status(404).json({ error: "Withdrawal not found or already processed" });
-        }
-
-        console.log(`[WITHDRAWAL] Processing approval for withdrawal ${id} by ${req.user.username}`);
-
-        // Step 2: Fetch user's bank details
-        const user = await new Promise((resolve, reject) => {
-            db.get(`SELECT bank_name, bank_account_number, bank_account_holder, bank_code, 
-                           paystack_recipient_code, paystack_recipient_id 
-                    FROM users WHERE LOWER(username) = LOWER(?)`, 
-                [withdrawal.username], (err, row) => {
-                if (err) reject(err);
-                else resolve(row);
-            });
-        });
-
-        if (!user) {
-            return res.status(404).json({ error: "User not found" });
-        }
-
-        // Validate user has complete bank details
-        if (!user.bank_account_number || !user.bank_account_holder || !user.bank_code) {
-            return res.status(400).json({ 
-                error: "User has incomplete bank details. Cannot process transfer." 
-            });
-        }
-
-        console.log(`[WITHDRAWAL] User bank details verified for ${withdrawal.username}`);
-
-        // Step 3: Create or reuse Paystack recipient
-        let recipient_code = user.paystack_recipient_code;
-        
-        if (!recipient_code) {
-            console.log(`[WITHDRAWAL] Creating new Paystack recipient for ${withdrawal.username}`);
-            const recipientResult = await paystackService.createPaystackRecipient(
-                user.bank_code,
-                user.bank_account_number,
-                user.bank_account_holder
-            );
-
-            if (!recipientResult.success) {
-                console.error(`[WITHDRAWAL] Failed to create recipient:`, recipientResult.error);
-                return res.status(400).json({ 
-                    error: "Failed to create Paystack recipient: " + recipientResult.error 
-                });
-            }
-
-            recipient_code = recipientResult.recipient_code;
-
-            // Save recipient code to user for future use
-            await new Promise((resolve, reject) => {
-                db.run(`UPDATE users SET paystack_recipient_code = ?, paystack_recipient_id = ? 
-                        WHERE LOWER(username) = LOWER(?)`,
-                    [recipient_code, recipientResult.recipient_id, withdrawal.username],
-                    (err) => {
-                        if (err) reject(err);
-                        else resolve();
-                    }
-                );
-            });
-
-            console.log(`[WITHDRAWAL] Recipient code saved: ${recipient_code}`);
-        } else {
-            console.log(`[WITHDRAWAL] Reusing existing Paystack recipient: ${recipient_code}`);
-        }
-
-        // Step 4: Initiate Paystack transfer
-        console.log(`[WITHDRAWAL] Initiating transfer: ${withdrawal.amount} NGN to ${recipient_code}`);
-        const transferResult = await paystackService.initiatePaystackTransfer(
-            recipient_code,
-            withdrawal.amount,
-            `Withdrawal to ${user.bank_account_holder} (Acct: ${user.bank_account_number})`
+        const result = await dbRunAsync(
+            `UPDATE withdrawals
+             SET status = 'processing', admin_note = ?, reviewed_by = ?, reviewed_at = datetime('now')
+             WHERE id = ? AND status = 'pending'`,
+            [note || 'Withdrawal approved for processing.', req.user.username, id]
         );
-
-        if (!transferResult.success) {
-            console.error(`[WITHDRAWAL] Transfer initiation failed:`, transferResult.error);
-            return res.status(400).json({ 
-                error: "Failed to initiate Paystack transfer: " + transferResult.error 
-            });
-        }
-
-        console.log(`[WITHDRAWAL] Transfer initiated: ${transferResult.reference}`);
-
-        // Step 5: Update withdrawal status to 'processing' with transfer reference (using transaction)
-        await new Promise((resolve, reject) => {
-            db.serialize(() => {
-                db.run('BEGIN TRANSACTION');
-                
-                db.run(`UPDATE withdrawals 
-                        SET status = 'processing', 
-                            admin_note = ?, 
-                            reviewed_by = ?, 
-                            reviewed_at = datetime('now'),
-                            paystack_transfer_reference = ?,
-                            paystack_transfer_date = datetime('now')
-                        WHERE id = ? AND status = 'pending'`,
-                    [note || 'Processing Paystack transfer', req.user.username, transferResult.reference, id],
-                    function(err) {
-                        if (err) {
-                            db.run('ROLLBACK');
-                            reject(err);
-                        } else if (this.changes === 0) {
-                            db.run('ROLLBACK');
-                            reject(new Error('Withdrawal status changed unexpectedly'));
-                        } else {
-                            db.run('COMMIT', (commitErr) => {
-                                if (commitErr) reject(commitErr);
-                                else resolve();
-                            });
-                        }
-                    }
-                );
-            });
-        });
-
-        console.warn(`[ADMIN] Withdrawal ${id} approved and processing by ${req.user.username}`);
-        
-        res.json({ 
-            success: true, 
-            message: "Withdrawal approved! Transfer initiated to Paystack.",
-            transfer_reference: transferResult.reference
-        });
-
+        if (!result.changes) return res.status(404).json({ error: 'Withdrawal not found or already processed' });
+        return res.json({ success: true, message: 'Withdrawal approved for processing.' });
     } catch (error) {
-        console.error(`[WITHDRAWAL] Error processing approval:`, error);
-        res.status(500).json({ error: "Server error: " + error.message });
+        console.error('Withdrawal approval error:', error.message);
+        return res.status(500).json({ error: 'Unable to approve withdrawal.' });
     }
 });
 
@@ -1409,7 +1302,7 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
             case 'taskEarnings': query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
             case 'daily_earnings': query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
             case 'affiliate_balance': query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
-            default: query = `UPDATE users SET balance = COALESCE(balance, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
+            default: query = `UPDATE users SET wallet_balance = COALESCE(wallet_balance, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
         }
         db.run(query, [parseFloat(amount), username], function(err) {
             if (err) return res.status(500).json({ error: "Database error." });
@@ -1425,43 +1318,35 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
 
 app.post('/api/admin/manual-credit', authenticateToken, adminOnly, (req, res) => {
     const { username, amount, walletType } = req.body;
-    console.log('[MANUAL-CREDIT DEBUG] Request:', { username, amount, walletType, adminUser: req.user?.username });
     
     if (!username || !isValidAmount(amount)) {
-        console.log('[MANUAL-CREDIT DEBUG] Validation failed');
         return res.status(400).json({ error: "Username and valid amount required" });
     }
     
-    // First, check if user exists and log their current balance
-    db.get(`SELECT id, username, balance, taskEarnings, daily_earnings, affiliate_balance FROM users WHERE LOWER(username) = LOWER(?)`, [username], (checkErr, user) => {
+    db.get(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [username], (checkErr, user) => {
         if (checkErr || !user) {
-            console.log('[MANUAL-CREDIT DEBUG] User not found:', username);
             return res.status(400).json({ error: "User not found" });
         }
-        console.log('[MANUAL-CREDIT DEBUG] User found:', { id: user.id, username: user.username, currentBalance: user.balance, currentTaskEarnings: user.taskEarnings, currentDaily: user.daily_earnings, currentAffiliate: user.affiliate_balance });
         
         let query = "";
         switch (walletType) {
             case 'taskEarnings': query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
             case 'daily_earnings': query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
             case 'affiliate_balance': query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
-            default: query = `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
+            default: query = `UPDATE users SET wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
         }
         
-        console.log('[MANUAL-CREDIT DEBUG] Executing query:', query);
         db.run(query, [parseFloat(amount), username], function (err) {
             if (err) {
-                console.error('[MANUAL-CREDIT DEBUG] Database error:', err.message, err);
-                return res.status(500).json({ error: "Database error: " + err.message });
+                console.error('Manual credit database error:', err.message);
+                return res.status(500).json({ error: 'Unable to credit wallet.' });
             }
-            console.log('[MANUAL-CREDIT DEBUG] Update result - changes:', this.changes);
             if (this.changes === 0) {
                 return res.status(400).json({ error: "User not found" });
             }
             
             // Verify the update worked by fetching updated balance
             db.get(`SELECT balance, taskEarnings, daily_earnings, affiliate_balance FROM users WHERE LOWER(username) = LOWER(?)`, [username], (verifyErr, updatedUser) => {
-                console.log('[MANUAL-CREDIT DEBUG] Updated user:', updatedUser);
                 console.warn(`[ADMIN] Manual credit of ₦${amount} to ${username}'s ${walletType || 'balance'} by ${req.user.username}`);
                 res.json({ success: true, message: `Successfully credited ₦${amount} to ${username}'s wallet!` });
             });
@@ -1616,13 +1501,13 @@ app.post('/api/admin/migrations/legacy-plans/run', authenticateToken, adminOnly,
             if (refundableCapital > 0) {
                 if (plan.user_id) {
                     await dbRunAsync(
-                        `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE id = ?`,
+                        `UPDATE users SET wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE id = ?`,
                         [refundableCapital, plan.user_id]
                     );
                     impactedUserIds.add(Number(plan.user_id));
                 } else if (plan.username) {
                     await dbRunAsync(
-                        `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`,
+                        `UPDATE users SET wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE LOWER(username) = LOWER(?)`,
                         [refundableCapital, plan.username]
                     );
                     impactedUsernames.add(String(plan.username));
