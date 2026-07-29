@@ -62,8 +62,22 @@ function getSquadApiUrl() {
 }
 
 function ensureSquadConfigured(res) {
-    if (process.env.SQUAD_SECRET_KEY) return true;
-    res.status(503).json({ error: 'Squad gateway is not configured on the server.' });
+    const secret = (process.env.SQUAD_SECRET_KEY || '').trim();
+    const isSandbox = getSquadApiUrl().includes('sandbox-api');
+    if (!secret) {
+        res.status(503).json({ error: 'Squad gateway is not configured on the server.' });
+        return false;
+    }
+    if (isSandbox && !secret.startsWith('sandbox_sk_')) {
+        res.status(503).json({ error: 'Squad sandbox configuration is invalid. Set Railway SQUAD_SECRET_KEY to the sandbox key from the Squad dashboard (it starts with sandbox_sk_).' });
+        return false;
+    }
+    if (!isSandbox && secret.startsWith('sandbox_sk_')) {
+        res.status(503).json({ error: 'Squad live configuration is invalid. Use the live secret key with the production Squad API URL.' });
+        return false;
+    }
+    if (isSandbox || secret.startsWith('sk_')) return true;
+    res.status(503).json({ error: 'Squad secret key format is invalid.' });
     return false;
 }
 
@@ -360,6 +374,15 @@ db.serialize(() => {
         started_at DATETIME,
         completed_at DATETIME,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    db.run(`CREATE TABLE IF NOT EXISTS admin_activity_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        admin_username TEXT NOT NULL,
+        target_username TEXT NOT NULL,
+        action TEXT NOT NULL,
+        details TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
     // ✅ NEW TABLES
@@ -1290,20 +1313,45 @@ app.post('/api/chat/welcome', authenticateToken, async (req, res) => {
 // ==========================================
 // 8. ADMIN COMMAND CENTER & UTILITIES
 // ==========================================
+const ADMIN_WALLET_COLUMNS = {
+    balance: 'balance',
+    taskEarnings: 'taskEarnings',
+    daily_earnings: 'daily_earnings',
+    affiliate_balance: 'affiliate_balance'
+};
+
+function getAdminWalletColumn(walletType) {
+    return ADMIN_WALLET_COLUMNS[walletType] || null;
+}
+
+async function recordAdminAction(adminUsername, targetUsername, action, details = {}) {
+    await dbRunAsync(
+        `INSERT INTO admin_activity_log (admin_username, target_username, action, details)
+         VALUES (?, ?, ?, ?)`,
+        [adminUsername, targetUsername, action, JSON.stringify(details)]
+    );
+}
+
 app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, res) => {
     try {
         const { username, amount, walletType, action } = req.body;
-        if (!username || !isValidAmount(amount)) {
+        const column = getAdminWalletColumn(walletType);
+        const numericAmount = Number(amount);
+        if (!username || !isValidAmount(numericAmount) || !column) {
             return res.status(400).json({ error: "Username and valid amount required" });
         }
-        let query = "";
-        const actionSign = action === 'subtract' ? '-' : '+';
-        switch (walletType) {
-            case 'taskEarnings': query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
-            case 'daily_earnings': query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
-            case 'affiliate_balance': query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
-            default: query = `UPDATE users SET wallet_balance = COALESCE(wallet_balance, 0) ${actionSign} ? WHERE LOWER(username) = LOWER(?)`; break;
-        }
+        if (!['add', 'subtract'].includes(action)) return res.status(400).json({ error: 'Action must be add or subtract.' });
+        const operator = action === 'subtract' ? '-' : '+';
+        const minimumCheck = action === 'subtract' ? `AND COALESCE(${column}, 0) >= ?` : '';
+        const params = action === 'subtract' ? [numericAmount, username, numericAmount] : [numericAmount, username];
+        const result = await dbRunAsync(
+            `UPDATE users SET ${column} = COALESCE(${column}, 0) ${operator} ?
+             WHERE LOWER(username) = LOWER(?) ${minimumCheck}`,
+            params
+        );
+        if (!result.changes) return res.status(400).json({ error: action === 'subtract' ? 'User not found or wallet has insufficient balance.' : 'User not found.' });
+        await recordAdminAction(req.user.username, username, `wallet_${action}`, { wallet: column, amount: numericAmount });
+        return res.json({ success: true, message: `Wallet updated successfully.` });
         db.run(query, [parseFloat(amount), username], function(err) {
             if (err) return res.status(500).json({ error: "Database error." });
             if (this.changes === 0) return res.status(400).json({ error: "User not found" });
@@ -1333,7 +1381,7 @@ app.post('/api/admin/manual-credit', authenticateToken, adminOnly, (req, res) =>
             case 'taskEarnings': query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
             case 'daily_earnings': query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
             case 'affiliate_balance': query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
-            default: query = `UPDATE users SET wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
+            default: query = `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
         }
         
         db.run(query, [parseFloat(amount), username], function (err) {
@@ -1354,8 +1402,78 @@ app.post('/api/admin/manual-credit', authenticateToken, adminOnly, (req, res) =>
     });
 });
 
+app.post('/api/admin/change-user-plan', authenticateToken, adminOnly, async (req, res) => {
+    const username = (req.body.username || '').trim();
+    const packageId = (req.body.packageId || '').trim().toLowerCase();
+    const selectedPackage = PACKAGE_BY_ID[packageId];
+    if (!username || !selectedPackage) return res.status(400).json({ error: 'A valid username and package are required.' });
+
+    let transactionOpen = false;
+    try {
+        const user = await dbGetAsync(`SELECT id, username FROM users WHERE LOWER(username) = LOWER(?)`, [username]);
+        if (!user) return res.status(404).json({ error: 'User not found.' });
+
+        await dbRunAsync('BEGIN IMMEDIATE TRANSACTION');
+        transactionOpen = true;
+        await dbRunAsync(
+            `UPDATE user_investments SET status = 'replaced_by_admin', completed_at = datetime('now')
+             WHERE user_id = ? AND status = 'active'`,
+            [user.id]
+        );
+        await dbRunAsync(
+            `UPDATE users SET planActivated = 'true', activePackage = ?, activePackageId = ? WHERE id = ?`,
+            [selectedPackage.name, selectedPackage.id, user.id]
+        );
+        await dbRunAsync(
+            `INSERT INTO user_investments
+             (user_id, username, package_id, package_name, capital, daily_rate, cycle_days, daily_earning, total_payout, referral_bonus, days_credited, status, activated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', datetime('now'))`,
+            [user.id, user.username, selectedPackage.id, selectedPackage.name, selectedPackage.capital,
+                selectedPackage.daily_rate, selectedPackage.cycle_days, selectedPackage.daily_earning,
+                selectedPackage.total_payout, getReferralBonus(selectedPackage)]
+        );
+        await recordAdminAction(req.user.username, user.username, 'change_plan', { packageId: selectedPackage.id, packageName: selectedPackage.name });
+        await dbRunAsync('COMMIT');
+        transactionOpen = false;
+        res.json({ success: true, message: `${user.username} is now on the ${selectedPackage.name} plan. Wallet balances were not changed.` });
+    } catch (error) {
+        if (transactionOpen) {
+            try { await dbRunAsync('ROLLBACK'); } catch (_) {}
+        }
+        console.error('Admin plan change failed:', error.message);
+        res.status(500).json({ error: 'Unable to update the user plan.' });
+    }
+});
+
+app.post('/api/admin/clear-total-balance', authenticateToken, adminOnly, async (req, res) => {
+    const username = (req.body.username || '').trim();
+    const confirmation = (req.body.confirmation || '').trim();
+    if (!username || confirmation !== `CLEAR ${username}`) {
+        return res.status(400).json({ error: 'Confirmation must exactly match CLEAR followed by the username.' });
+    }
+    try {
+        const user = await dbGetAsync(
+            `SELECT id, username, balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance
+             FROM users WHERE LOWER(username) = LOWER(?)`,
+            [username]
+        );
+        if (!user) return res.status(404).json({ error: 'User not found.' });
+        const totalCleared = ['balance', 'wallet_balance', 'taskEarnings', 'daily_earnings', 'affiliate_balance']
+            .reduce((sum, key) => sum + Number(user[key] || 0), 0);
+        await dbRunAsync(
+            `UPDATE users SET balance = 0, wallet_balance = 0, taskEarnings = 0, daily_earnings = 0, affiliate_balance = 0 WHERE id = ?`,
+            [user.id]
+        );
+        await recordAdminAction(req.user.username, user.username, 'clear_total_balance', { totalCleared });
+        res.json({ success: true, message: `Cleared ₦${totalCleared.toLocaleString()} across all liquid wallet balances for ${user.username}. Active plans were not changed.`, totalCleared });
+    } catch (error) {
+        console.error('Clear total balance failed:', error.message);
+        res.status(500).json({ error: 'Unable to clear the user balance.' });
+    }
+});
+
 app.get('/api/admin/users', authenticateToken, adminOnly, (req, res) => {
-    db.all(`SELECT id, username, balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance, planActivated, activePackage, role, created_at FROM users ORDER BY id DESC`, [], (err, rows) => {
+    db.all(`SELECT id, username, balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance, planActivated, activePackage, activePackageId, role, status, created_at FROM users ORDER BY id DESC`, [], (err, rows) => {
         if (err) return res.status(500).json({ error: "Database error" });
         res.json({ success: true, users: rows });
     });
