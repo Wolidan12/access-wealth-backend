@@ -41,10 +41,42 @@ app.use(cors({
 }));
 
 app.use(express.json({
+    limit: '12mb',
     verify: (req, res, buf) => {
         req.rawBody = buf;
     }
 }));
+
+// ==========================================
+// MANUAL PAYMENT CONFIGURATION
+// Squad live API is not available yet, so deposits are handled manually.
+// Users transfer to this account and upload a payment receipt for admin approval.
+// ==========================================
+const MANUAL_PAYMENT_INFO = {
+    bank_name: process.env.MANUAL_BANK_NAME || 'Moniepoint',
+    account_name: process.env.MANUAL_ACCOUNT_NAME || 'Luna Entry Services - Access Wealth HQ',
+    account_number: process.env.MANUAL_ACCOUNT_NUMBER || '6977298247',
+    bank_code: process.env.MANUAL_BANK_CODE || '',
+    currency: process.env.MANUAL_CURRENCY || 'NGN',
+    instructions: process.env.MANUAL_PAYMENT_INSTRUCTIONS ||
+        'Transfer the deposit amount to the account below, then upload your payment receipt to complete the request. Your deposit will be credited to your wallet once an admin approves it.',
+    enabled: (process.env.MANUAL_PAYMENT_ENABLED || 'true') !== 'false'
+};
+
+function getManualPaymentInfo() {
+    return MANUAL_PAYMENT_INFO;
+}
+
+function parseDataUrl(dataUrl) {
+    const match = /^data:([a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(String(dataUrl || '').trim());
+    if (!match) return null;
+    return {
+        mime: match[1],
+        buffer: Buffer.from(match[2], 'base64')
+    };
+}
+
+const MAX_RECEIPT_SIZE = 5 * 1024 * 1024; // 5MB
 
 app.use(express.static(__dirname));
 
@@ -259,9 +291,23 @@ db.serialize(() => {
         sender_name TEXT, 
         payment_method TEXT,
         transaction_ref TEXT,
+        receipt TEXT,
+        receipt_mime TEXT,
         status TEXT DEFAULT 'pending', 
+        admin_note TEXT,
+        reviewed_by TEXT,
+        reviewed_at DATETIME,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
+    const depositColumnsToAdd = [
+        { name: 'receipt', type: 'TEXT' },
+        { name: 'receipt_mime', type: 'TEXT' },
+        { name: 'user_id', type: 'INTEGER' },
+        { name: 'admin_note', type: 'TEXT' },
+        { name: 'reviewed_by', type: 'TEXT' },
+        { name: 'reviewed_at', type: 'DATETIME' }
+    ];
+    depositColumnsToAdd.forEach((col) => addColumnIfMissing('deposits', col.name, col.type));
     db.run(`CREATE TABLE IF NOT EXISTS squad_transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT,
@@ -1179,47 +1225,234 @@ app.get('/api/user/pending-withdrawal', authenticateToken, (req, res) => {
 });
 
 // ==========================================
-// 5. DEPOSIT REQUESTS (User initiated)
+// 5. DEPOSIT REQUESTS (User initiated) — MANUAL PAYMENTS
 // ==========================================
+
+// Public: manual transfer account details shown to users.
+app.get('/api/payment/manual-info', (req, res) => {
+    res.json({ success: true, payment: getManualPaymentInfo() });
+});
+
+// Helper to strip heavy receipt data out of JSON list responses.
+function stripReceipt(deposit) {
+    if (!deposit) return deposit;
+    const clone = { ...deposit };
+    if (clone.receipt) {
+        clone.has_receipt = true;
+        delete clone.receipt;
+        delete clone.receipt_mime;
+    } else {
+        clone.has_receipt = false;
+    }
+    return clone;
+}
+
 app.post('/api/request-deposit', authenticateToken, async (req, res) => {
     try {
-        const { amount, payment_method, transaction_ref } = req.body;
+        const { amount, payment_method, transaction_ref, sender_name, receipt } = req.body;
         const username = req.user.username;
-        if (!amount || amount < 1000) {
+
+        if (!amount || !isValidAmount(amount) || amount < 1000) {
             return res.status(400).json({ error: "Minimum deposit amount is ₦1,000" });
         }
-        db.run(`INSERT INTO deposits (username, amount, sender_name, status, payment_method, transaction_ref) 
-                VALUES (?, ?, ?, 'pending', ?, ?)`,
-                [username, amount, username, payment_method || 'bank_transfer', transaction_ref || null], function(err) {
-            if (err) return res.status(500).json({ error: "Failed to create deposit request" });
-            res.json({ success: true, message: "Deposit request submitted. Awaiting admin approval." });
+
+        if (!getManualPaymentInfo().enabled) {
+            return res.status(403).json({ error: "Manual deposits are currently disabled." });
+        }
+
+        let receiptMime = null;
+        let receiptData = null;
+        if (receipt) {
+            const parsed = parseDataUrl(receipt);
+            if (!parsed) {
+                return res.status(400).json({ error: "Invalid receipt format. Please upload a valid image (PNG/JPG/PDF)." });
+            }
+            if (!/^image\/(png|jpe?g|gif|webp)$/.test(parsed.mime) && parsed.mime !== 'application/pdf') {
+                return res.status(400).json({ error: "Receipt must be a PNG, JPG, GIF, WEBP or PDF file." });
+            }
+            if (parsed.buffer.length === 0) {
+                return res.status(400).json({ error: "Receipt file appears to be empty." });
+            }
+            if (parsed.buffer.length > MAX_RECEIPT_SIZE) {
+                return res.status(400).json({ error: "Receipt file is too large. Maximum size is 5MB." });
+            }
+            receiptData = parsed.buffer.toString('base64');
+            receiptMime = parsed.mime;
+        } else {
+            return res.status(400).json({ error: "Please upload your payment receipt to complete the deposit request." });
+        }
+
+        const userRow = await dbGetAsync(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [username]);
+
+        await dbRunAsync(
+            `INSERT INTO deposits (username, user_id, amount, sender_name, status, payment_method, transaction_ref, receipt, receipt_mime)
+             VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
+            [
+                username,
+                userRow ? userRow.id : null,
+                parseFloat(amount),
+                sender_name || username,
+                payment_method || 'bank_transfer',
+                transaction_ref || null,
+                receiptData,
+                receiptMime
+            ]
+        );
+
+        res.json({
+            success: true,
+            message: "Deposit request submitted. Your receipt has been uploaded and is awaiting admin approval."
         });
     } catch (error) {
-        res.status(500).json({ error: "Server error" });
+        console.error('Deposit request error:', error.message);
+        res.status(500).json({ error: "Server error. Please try again." });
     }
 });
 
-app.get('/api/admin/deposits', authenticateToken, adminOnly, (req, res) => {
-    db.all(`SELECT * FROM deposits WHERE status = 'pending' ORDER BY created_at DESC`, [], (err, rows) => {
-        res.json({ success: true, deposits: rows });
-    });
+// User: their own deposit history.
+// NOTE: uses /api/my-deposits (not /api/user/deposits) to avoid being captured
+// by the GET /api/user/:username route which is registered earlier.
+app.get('/api/my-deposits', authenticateToken, async (req, res) => {
+    const username = req.user.username;
+    try {
+        const rows = await dbAllAsync(
+            `SELECT id, amount, sender_name, payment_method, transaction_ref, status, admin_note, receipt, receipt_mime, created_at, reviewed_at
+             FROM deposits WHERE username = ? ORDER BY created_at DESC`,
+            [username]
+        );
+        const cleaned = rows.map((row) => ({
+            id: row.id,
+            amount: row.amount,
+            sender_name: row.sender_name,
+            payment_method: row.payment_method,
+            transaction_ref: row.transaction_ref,
+            status: row.status,
+            admin_note: row.admin_note,
+            created_at: row.created_at,
+            reviewed_at: row.reviewed_at
+        }));
+        res.json({ success: true, deposits: cleaned });
+    } catch (error) {
+        res.status(500).json({ error: "Failed to load deposits." });
+    }
 });
 
-app.post('/api/admin/approve-deposit', authenticateToken, adminOnly, (req, res) => {
+// User: view their own receipt image.
+app.get('/api/user/deposit/:id/receipt', authenticateToken, async (req, res) => {
+    try {
+        const deposit = await dbGetAsync(`SELECT * FROM deposits WHERE id = ?`, [req.params.id]);
+        if (!deposit) return res.status(404).json({ error: "Deposit not found." });
+        if (deposit.username.toLowerCase() !== req.user.username.toLowerCase() && req.user.role !== 'admin') {
+            return res.status(403).json({ error: "Unauthorized." });
+        }
+        if (!deposit.receipt) return res.status(404).json({ error: "No receipt uploaded for this deposit." });
+        const buffer = Buffer.from(deposit.receipt, 'base64');
+        res.setHeader('Content-Type', deposit.receipt_mime || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `inline; filename="deposit-${deposit.id}-receipt"`);
+        res.send(buffer);
+    } catch (error) {
+        res.status(500).json({ error: "Failed to load receipt." });
+    }
+});
+
+// Admin: list deposits (filtered by status via query ?status=). Defaults to pending.
+app.get('/api/admin/deposits', authenticateToken, adminOnly, async (req, res) => {
+    try {
+        const status = req.query.status || 'pending';
+        const allowed = ['pending', 'approved', 'declined', 'all'];
+        const where = allowed.includes(status) && status !== 'all' ? `WHERE status = ?` : '';
+        const params = allowed.includes(status) && status !== 'all' ? [status] : [];
+        const rows = await dbAllAsync(
+            `SELECT * FROM deposits ${where} ORDER BY created_at DESC`,
+            params
+        );
+        res.json({ success: true, deposits: rows.map(stripReceipt) });
+    } catch (error) {
+        res.status(500).json({ error: "Failed to load deposits." });
+    }
+});
+
+// Admin: all deposit history.
+app.get('/api/admin/all-deposits', authenticateToken, adminOnly, async (req, res) => {
+    try {
+        const rows = await dbAllAsync(`SELECT * FROM deposits ORDER BY created_at DESC`, []);
+        res.json({ success: true, deposits: rows.map(stripReceipt) });
+    } catch (error) {
+        res.status(500).json({ error: "Failed to load deposits." });
+    }
+});
+
+// Admin: view a deposit receipt image.
+app.get('/api/admin/deposit/:id/receipt', authenticateToken, adminOnly, async (req, res) => {
+    try {
+        const deposit = await dbGetAsync(`SELECT * FROM deposits WHERE id = ?`, [req.params.id]);
+        if (!deposit) return res.status(404).json({ error: "Deposit not found." });
+        if (!deposit.receipt) return res.status(404).json({ error: "No receipt uploaded for this deposit." });
+        const buffer = Buffer.from(deposit.receipt, 'base64');
+        res.setHeader('Content-Type', deposit.receipt_mime || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `inline; filename="deposit-${deposit.id}-receipt"`);
+        res.send(buffer);
+    } catch (error) {
+        res.status(500).json({ error: "Failed to load receipt." });
+    }
+});
+
+// Admin: approve a pending manual deposit (credits the user's balance).
+app.post('/api/admin/approve-deposit', authenticateToken, adminOnly, async (req, res) => {
     const { depositId } = req.body;
     if (!depositId) return res.status(400).json({ error: "Deposit ID required" });
-    db.get(`SELECT * FROM deposits WHERE id = ?`, [depositId], (err, deposit) => {
-        if (err || !deposit) return res.status(400).json({ error: "Deposit not found." });
-        db.run(`UPDATE deposits SET status = 'approved' WHERE id = ? AND status = 'pending'`, [deposit.id], function (updateErr) {
-            if (updateErr) return res.status(500).json({ error: "Database error" });
-            if (this.changes === 0) return res.status(400).json({ error: "Deposit already processed or not pending." });
-            db.run(`UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`, [deposit.amount, deposit.username], function (creditErr) {
-                if (creditErr) return res.status(500).json({ error: "Failed to credit user" });
-                console.warn(`[ADMIN] Deposit ${deposit.id} approved by ${req.user.username}`);
-                res.json({ success: true, message: `Deposit of ₦${deposit.amount} approved for ${deposit.username}` });
-            });
-        });
-    });
+    try {
+        const deposit = await dbGetAsync(`SELECT * FROM deposits WHERE id = ?`, [depositId]);
+        if (!deposit) return res.status(404).json({ error: "Deposit not found." });
+
+        const updateResult = await dbRunAsync(
+            `UPDATE deposits SET status = 'approved', reviewed_by = ?, reviewed_at = datetime('now')
+             WHERE id = ? AND status = 'pending'`,
+            [req.user.username, deposit.id]
+        );
+        if (updateResult.changes === 0) {
+            return res.status(400).json({ error: "Deposit already processed or not pending." });
+        }
+
+        const creditResult = await dbRunAsync(
+            `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`,
+            [deposit.amount, deposit.username]
+        );
+        if (!creditResult.changes) {
+            // User not found — revert the status so the deposit stays pending.
+            await dbRunAsync(`UPDATE deposits SET status = 'pending', reviewed_by = NULL, reviewed_at = NULL WHERE id = ?`, [deposit.id]);
+            return res.status(400).json({ error: "Deposit user no longer exists." });
+        }
+
+        try {
+            await recordAdminAction(req.user.username, deposit.username, 'deposit_approve', { depositId: deposit.id, amount: deposit.amount });
+        } catch (e) { /* non-blocking */ }
+
+        console.warn(`[ADMIN] Deposit ${deposit.id} approved by ${req.user.username}`);
+        res.json({ success: true, message: `Deposit of ₦${deposit.amount} approved and credited to ${deposit.username}` });
+    } catch (error) {
+        console.error('Approve deposit error:', error.message);
+        res.status(500).json({ error: "Failed to approve deposit." });
+    }
+});
+
+// Admin: decline a pending manual deposit.
+app.post('/api/admin/decline-deposit', authenticateToken, adminOnly, async (req, res) => {
+    const { depositId, note } = req.body;
+    if (!depositId) return res.status(400).json({ error: "Deposit ID required" });
+    try {
+        const result = await dbRunAsync(
+            `UPDATE deposits SET status = 'declined', admin_note = ?, reviewed_by = ?, reviewed_at = datetime('now')
+             WHERE id = ? AND status = 'pending'`,
+            [note || 'Your deposit was declined. Please contact support.', req.user.username, depositId]
+        );
+        if (result.changes === 0) return res.status(400).json({ error: "Deposit not found or already processed." });
+        console.warn(`[ADMIN] Deposit ${depositId} declined by ${req.user.username}`);
+        res.json({ success: true, message: "Deposit declined." });
+    } catch (error) {
+        console.error('Decline deposit error:', error.message);
+        res.status(500).json({ error: "Failed to decline deposit." });
+    }
 });
 
 // ==========================================
@@ -1364,42 +1597,53 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
     }
 });
 
-app.post('/api/admin/manual-credit', authenticateToken, adminOnly, (req, res) => {
-    const { username, amount, walletType } = req.body;
-    
-    if (!username || !isValidAmount(amount)) {
-        return res.status(400).json({ error: "Username and valid amount required" });
-    }
-    
-    db.get(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [username], (checkErr, user) => {
-        if (checkErr || !user) {
+// Manual credit: admin adds funds to any wallet. Supports walletType: 'balance', 'taskEarnings',
+// 'daily_earnings', 'affiliate_balance'. Returns the updated balance.
+app.post('/api/admin/manual-credit', authenticateToken, adminOnly, async (req, res) => {
+    try {
+        const { username, amount, walletType } = req.body;
+        const numericAmount = Number(amount);
+
+        if (!username || !isValidAmount(numericAmount)) {
+            return res.status(400).json({ error: "Username and valid amount required" });
+        }
+
+        const walletColumn = getAdminWalletColumn(walletType || 'balance');
+        if (!walletColumn) {
+            return res.status(400).json({ error: "Invalid wallet type. Use balance, taskEarnings, daily_earnings or affiliate_balance." });
+        }
+
+        const user = await dbGetAsync(`SELECT id, username FROM users WHERE LOWER(username) = LOWER(?)`, [username]);
+        if (!user) {
+            return res.status(404).json({ error: "User not found" });
+        }
+
+        const result = await dbRunAsync(
+            `UPDATE users SET ${walletColumn} = COALESCE(${walletColumn}, 0) + ?
+             WHERE LOWER(username) = LOWER(?)`,
+            [numericAmount, username]
+        );
+        if (!result.changes) {
             return res.status(400).json({ error: "User not found" });
         }
-        
-        let query = "";
-        switch (walletType) {
-            case 'taskEarnings': query = `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
-            case 'daily_earnings': query = `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
-            case 'affiliate_balance': query = `UPDATE users SET affiliate_balance = COALESCE(affiliate_balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
-            default: query = `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`; break;
-        }
-        
-        db.run(query, [parseFloat(amount), username], function (err) {
-            if (err) {
-                console.error('Manual credit database error:', err.message);
-                return res.status(500).json({ error: 'Unable to credit wallet.' });
-            }
-            if (this.changes === 0) {
-                return res.status(400).json({ error: "User not found" });
-            }
-            
-            // Verify the update worked by fetching updated balance
-            db.get(`SELECT balance, taskEarnings, daily_earnings, affiliate_balance FROM users WHERE LOWER(username) = LOWER(?)`, [username], (verifyErr, updatedUser) => {
-                console.warn(`[ADMIN] Manual credit of ₦${amount} to ${username}'s ${walletType || 'balance'} by ${req.user.username}`);
-                res.json({ success: true, message: `Successfully credited ₦${amount} to ${username}'s wallet!` });
-            });
+
+        await recordAdminAction(req.user.username, username, 'manual_credit', { wallet: walletColumn, amount: numericAmount });
+
+        const updated = await dbGetAsync(
+            `SELECT balance, taskEarnings, daily_earnings, affiliate_balance FROM users WHERE LOWER(username) = LOWER(?)`,
+            [username]
+        );
+
+        console.warn(`[ADMIN] Manual credit of ₦${numericAmount} to ${username}'s ${walletColumn} by ${req.user.username}`);
+        res.json({
+            success: true,
+            message: `Successfully credited ₦${numericAmount} to ${username}'s wallet!`,
+            updatedBalance: updated
         });
-    });
+    } catch (error) {
+        console.error('Manual credit error:', error.message);
+        res.status(500).json({ error: "Server error: " + error.message });
+    }
 });
 
 app.post('/api/admin/change-user-plan', authenticateToken, adminOnly, async (req, res) => {
