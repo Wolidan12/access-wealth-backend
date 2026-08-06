@@ -203,7 +203,15 @@ function dbAllAsync(sql, params = []) {
 // Minimal SQLite busy-retry: re-run a DB operation when SQLite reports the
 // database is locked (SQLITE_BUSY), which can happen under concurrent writes.
 // This complements the connection-level busyTimeout configured at startup.
-const SQLITE_BUSY_RETRY_MAX_ATTEMPTS = 5;
+//
+// The busyTimeout below is deliberately small (2s) and the retry is capped at 3
+// attempts with short back-off so that a write (e.g. a deposit insert) that hits
+// a locked database either completes quickly or fails fast — it never blocks for
+// 10s+ per attempt. Before this fix a deposit request could hang for ~18-50s while
+// SQLite waited on a busy lock; the client would time out and show "server error",
+// yet the backend would eventually commit the deposit, so it silently appeared on
+// the admin approval page (and the user often re-submitted, creating duplicates).
+const SQLITE_BUSY_RETRY_MAX_ATTEMPTS = 3;
 const SQLITE_BUSY_RETRY_BASE_DELAY_MS = 100;
 
 function isSqliteBusyError(err) {
@@ -256,7 +264,7 @@ const db = new sqlite3.Database(dbPath, (err) => {
     if (err) {
         console.error("Database connection error:", err.message);
     } else {
-        db.configure('busyTimeout', 10000);
+        db.configure('busyTimeout', 2000);
         db.run("PRAGMA journal_mode=WAL;", (pragmaErr) => {
             if (pragmaErr) console.error("Failed to enable WAL mode:", pragmaErr.message);
         });
@@ -1310,6 +1318,21 @@ app.post('/api/request-deposit', authenticateToken, async (req, res) => {
         }
 
         const userRow = await dbGetAsync(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [username]);
+
+        // Idempotency guard: if the client retries with the same transaction
+        // reference (common after a timeout), don't create a duplicate deposit.
+        if (transaction_ref) {
+            const existing = await dbGetAsync(
+                `SELECT id FROM deposits WHERE username = ? AND transaction_ref = ? AND status = 'pending' LIMIT 1`,
+                [username, transaction_ref]
+            );
+            if (existing) {
+                return res.json({
+                    success: true,
+                    message: "This deposit request was already submitted and is awaiting admin approval."
+                });
+            }
+        }
 
         await withSqliteBusyRetry(
             () => dbRunAsync(
