@@ -200,6 +200,73 @@ function dbAllAsync(sql, params = []) {
     });
 }
 
+// Returns true when a table column already exists. Used to make schema
+// migrations idempotent and to gate write endpoints on required columns.
+function tableHasColumn(tableName, columnName) {
+    return new Promise((resolve) => {
+        db.all(`PRAGMA table_info(${tableName})`, [], (err, columns) => {
+            if (err) return resolve(false);
+            resolve(Array.isArray(columns) && columns.some((c) => c.name === columnName));
+        });
+    });
+}
+
+// Promise-wrapped ADD COLUMN. Resolves once the ALTER finishes (or when the
+// column already exists), so callers can await schema changes at startup or on
+// demand. Unlike the fire-and-forget addColumnIfMissing() used during init, this
+// is safe to depend on before issuing a write that needs the column.
+function addColumnIfMissingAsync(tableName, columnName, columnType) {
+    return new Promise((resolve, reject) => {
+        db.run(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnType}`, (err) => {
+            if (err && err.message && err.message.includes('duplicate column name')) {
+                return resolve();
+            }
+            if (err) return reject(err);
+            resolve();
+        });
+    });
+}
+
+// Runtime guarantee that the deposits table has every column referenced by the
+// deposit INSERT / SELECT statements. The startup migration list already adds
+// these, but on a long-lived production database the columns can be missing if
+// they were only ever declared in CREATE TABLE IF NOT EXISTS (a no-op once the
+// table exists). We re-check here so a request can never fail with
+// "no such column" because the schema drifted or the startup ALTER was skipped.
+let depositSchemaPromise = null;
+function ensureDepositSchema() {
+    if (!depositSchemaPromise) {
+        depositSchemaPromise = (async () => {
+            const required = [
+                { name: 'sender_name', type: 'TEXT' },
+                { name: 'payment_method', type: 'TEXT' },
+                { name: 'transaction_ref', type: 'TEXT' },
+                { name: 'receipt', type: 'TEXT' },
+                { name: 'receipt_mime', type: 'TEXT' },
+                { name: 'user_id', type: 'INTEGER' },
+                { name: 'admin_note', type: 'TEXT' },
+                { name: 'reviewed_by', type: 'TEXT' },
+                { name: 'reviewed_at', type: 'DATETIME' }
+            ];
+            for (const col of required) {
+                // eslint-disable-next-line no-await-in-loop
+                const exists = await tableHasColumn('deposits', col.name);
+                if (!exists) {
+                    // eslint-disable-next-line no-await-in-loop
+                    await addColumnIfMissingAsync('deposits', col.name, col.type);
+                    console.warn(`[DB] deposits.${col.name} was missing and has been added.`);
+                }
+            }
+        })().catch((err) => {
+            // Allow a retry on the next request if this attempt failed.
+            depositSchemaPromise = null;
+            console.error('[DB] Failed to ensure deposits schema:', err.message);
+            throw err;
+        });
+    }
+    return depositSchemaPromise;
+}
+
 // Minimal SQLite busy-retry: re-run a DB operation when SQLite reports the
 // database is locked (SQLITE_BUSY), which can happen under concurrent writes.
 // This complements the connection-level busyTimeout configured at startup.
@@ -334,7 +401,16 @@ db.serialize(() => {
         reviewed_at DATETIME,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
+    // NOTE: `CREATE TABLE IF NOT EXISTS deposits` above is a NO-OP on the existing
+    // production database (the table already exists), so columns that were only
+    // added to that CREATE statement (sender_name, payment_method, transaction_ref)
+    // are NOT present on prod. They must be added here via ALTER TABLE, otherwise
+    // the deposit INSERT fails with "no such column: payment_method". Every column
+    // referenced by an INSERT/SELECT against `deposits` must be in this list.
     const depositColumnsToAdd = [
+        { name: 'sender_name', type: 'TEXT' },
+        { name: 'payment_method', type: 'TEXT' },
+        { name: 'transaction_ref', type: 'TEXT' },
         { name: 'receipt', type: 'TEXT' },
         { name: 'receipt_mime', type: 'TEXT' },
         { name: 'user_id', type: 'INTEGER' },
@@ -1284,6 +1360,12 @@ function stripReceipt(deposit) {
 
 app.post('/api/request-deposit', authenticateToken, async (req, res) => {
     try {
+        // Guarantee the deposits table has all columns referenced by the INSERT
+        // below before we attempt it. On existing production DBs these columns
+        // may be missing because they were only declared in CREATE TABLE IF NOT
+        // EXISTS, which is a no-op once the table exists.
+        await ensureDepositSchema();
+
         const { amount, payment_method, transaction_ref, sender_name, receipt } = req.body;
         const username = req.user.username;
 
