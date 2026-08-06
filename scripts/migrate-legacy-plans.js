@@ -144,15 +144,15 @@ async function runMigration() {
                 if (planUserIdColumn && plan[planUserIdColumn]) {
                     const userId = Number(plan[planUserIdColumn]);
                     await run(
-                        'UPDATE users SET wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE id = ?',
-                        [refundableCapital, userId]
+                        'UPDATE users SET balance = COALESCE(balance, 0) + ?, wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE id = ?',
+                        [refundableCapital, refundableCapital, userId]
                     );
                     affectedUserIds.add(userId);
                 } else if (planUsernameColumn && plan[planUsernameColumn]) {
                     const username = String(plan[planUsernameColumn]);
                     await run(
-                        'UPDATE users SET wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE LOWER(username) = LOWER(?)',
-                        [refundableCapital, username]
+                        'UPDATE users SET balance = COALESCE(balance, 0) + ?, wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE LOWER(username) = LOWER(?)',
+                        [refundableCapital, refundableCapital, username]
                     );
                     affectedUsernames.add(username);
                 }

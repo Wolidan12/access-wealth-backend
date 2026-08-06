@@ -385,6 +385,11 @@ db.serialize(() => {
 
     columnsToAdd.forEach((col) => addColumnIfMissing('users', col.name, col.type));
 
+    // Ensure main balances are synchronized for existing users
+    db.run(`UPDATE users SET wallet_balance = balance WHERE (wallet_balance IS NULL OR wallet_balance = 0) AND balance > 0`);
+    db.run(`UPDATE users SET balance = wallet_balance WHERE (balance IS NULL OR balance = 0) AND wallet_balance > 0`);
+
+
     // Existing tables
     db.run(`CREATE TABLE IF NOT EXISTS deposits (
         id INTEGER PRIMARY KEY AUTOINCREMENT, 
@@ -862,7 +867,7 @@ app.post('/api/login', authLimiter, async (req, res) => {
                     activePackage: user.activePackage,
                     activePackageId: user.activePackageId,
                     my_referral_id: user.my_referral_id,
-                    wallet_balance: user.wallet_balance ?? user.balance ?? 0,
+                    wallet_balance: (user.wallet_balance || user.balance) ?? 0,
                     balance: user.balance ?? 0
                 }
             });
@@ -1031,8 +1036,11 @@ app.post('/api/squad/webhook', webhookLimiter, async (req, res) => {
             }
 
             const creditResult = await dbRunAsync(
-                `UPDATE users SET wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE id = ?`,
-                [paidAmount, transaction.user_id]
+                `UPDATE users SET 
+                    balance = COALESCE(balance, 0) + ?,
+                    wallet_balance = COALESCE(wallet_balance, 0) + ?
+                 WHERE id = ?`,
+                [paidAmount, paidAmount, transaction.user_id]
             );
             if (!creditResult.changes) throw new Error('User not found for credited transaction.');
 
@@ -1155,9 +1163,9 @@ app.post('/api/activate', authenticateToken, actionLimiter, (req, res) => {
 
             db.run(
                 `UPDATE users
-                 SET balance = ?, planActivated = 'true', activePackage = ?, activePackageId = ?
+                 SET balance = ?, wallet_balance = ?, planActivated = 'true', activePackage = ?, activePackageId = ?
                  WHERE id = ? AND planActivated = 'false'`,
-                [newBalance, selectedPackage.name, selectedPackage.id, req.user.id],
+                [newBalance, newBalance, selectedPackage.name, selectedPackage.id, req.user.id],
                 function (updateErr) {
                     if (updateErr) return res.status(500).json({ error: 'Database error.' });
                     if (this.changes === 0) {
@@ -1184,8 +1192,8 @@ app.post('/api/activate', authenticateToken, actionLimiter, (req, res) => {
                             if (insertErr) {
                                 // Roll back user activation if investment row fails.
                                 db.run(
-                                    `UPDATE users SET balance = ?, planActivated = 'false', activePackage = 'None', activePackageId = NULL WHERE id = ?`,
-                                    [user.balance, req.user.id]
+                                    `UPDATE users SET balance = ?, wallet_balance = ?, planActivated = 'false', activePackage = 'None', activePackageId = NULL WHERE id = ?`,
+                                    [user.balance, user.balance, req.user.id]
                                 );
                                 return res.status(500).json({ error: 'Failed to create package cycle.' });
                             }
@@ -1239,8 +1247,16 @@ app.post('/api/request-withdrawal', authenticateToken, async (req, res) => {
                 if (err || !user) return res.status(404).json({ error: 'User not found' });
                 if (user.balance < amount) return res.status(400).json({ error: 'Insufficient balance' });
 
-                db.run(`UPDATE users SET ${walletField} = ${walletField} - ? WHERE LOWER(username) = LOWER(?) AND ${walletField} >= ?`,
-                    [amount, username, amount], function(updateErr) {
+                let updateSql, params;
+                if (walletField === 'balance') {
+                    updateSql = `UPDATE users SET balance = balance - ?, wallet_balance = wallet_balance - ? WHERE LOWER(username) = LOWER(?) AND balance >= ?`;
+                    params = [amount, amount, username, amount];
+                } else {
+                    updateSql = `UPDATE users SET ${walletField} = ${walletField} - ? WHERE LOWER(username) = LOWER(?) AND ${walletField} >= ?`;
+                    params = [amount, username, amount];
+                }
+
+                db.run(updateSql, params, function(updateErr) {
                         if (updateErr || this.changes === 0) return res.status(500).json({ error: 'Failed to process withdrawal' });
 
                         const bankDetailsStr = JSON.stringify(bank_details || {});
@@ -1303,8 +1319,14 @@ app.post('/api/admin/decline-withdrawal', authenticateToken, adminOnly, (req, re
         if (withdrawal.wallet_type === 'affiliate') walletField = 'affiliate_balance';
         else if (withdrawal.wallet_type === 'task') walletField = 'taskEarnings';
         else walletField = 'balance';
-        db.run(`UPDATE users SET ${walletField} = ${walletField} + ? WHERE LOWER(username) = LOWER(?)`,
-            [withdrawal.amount, withdrawal.username], function(refundErr) {
+        const updateSql = walletField === 'balance'
+            ? `UPDATE users SET balance = balance + ?, wallet_balance = wallet_balance + ? WHERE LOWER(username) = LOWER(?)`
+            : `UPDATE users SET ${walletField} = ${walletField} + ? WHERE LOWER(username) = LOWER(?)`;
+        const params = walletField === 'balance'
+            ? [withdrawal.amount, withdrawal.amount, withdrawal.username]
+            : [withdrawal.amount, withdrawal.username];
+
+        db.run(updateSql, params, function(refundErr) {
             if (refundErr) return res.status(500).json({ error: "Failed to refund user" });
             db.run(`UPDATE withdrawals SET status = 'declined', admin_note = ?, reviewed_by = ?, reviewed_at = datetime('now') 
                     WHERE id = ? AND status = 'pending'`,
@@ -1550,8 +1572,11 @@ app.post('/api/admin/approve-deposit', authenticateToken, adminOnly, async (req,
         }
 
         const creditResult = await dbRunAsync(
-            `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE LOWER(username) = LOWER(?)`,
-            [deposit.amount, deposit.username]
+            `UPDATE users SET 
+                balance = COALESCE(balance, 0) + ?,
+                wallet_balance = COALESCE(wallet_balance, 0) + ?
+             WHERE LOWER(username) = LOWER(?)`,
+            [deposit.amount, deposit.amount, deposit.username]
         );
         if (!creditResult.changes) {
             // User not found — revert the status so the deposit stays pending.
@@ -1712,11 +1737,18 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
         const operator = action === 'subtract' ? '-' : '+';
         const minimumCheck = action === 'subtract' ? `AND COALESCE(${column}, 0) >= ?` : '';
         const params = action === 'subtract' ? [numericAmount, username, numericAmount] : [numericAmount, username];
-        const result = await dbRunAsync(
-            `UPDATE users SET ${column} = COALESCE(${column}, 0) ${operator} ?
-             WHERE LOWER(username) = LOWER(?) ${minimumCheck}`,
-            params
-        );
+        let updateSql, finalParams;
+        if (column === 'balance') {
+            updateSql = `UPDATE users SET balance = COALESCE(balance, 0) ${operator} ?, wallet_balance = COALESCE(wallet_balance, 0) ${operator} ?
+                         WHERE LOWER(username) = LOWER(?) ${minimumCheck.replace(column, 'balance')}`;
+            finalParams = action === 'subtract' ? [numericAmount, numericAmount, username, numericAmount] : [numericAmount, numericAmount, username];
+        } else {
+            updateSql = `UPDATE users SET ${column} = COALESCE(${column}, 0) ${operator} ?
+                         WHERE LOWER(username) = LOWER(?) ${minimumCheck}`;
+            finalParams = params;
+        }
+
+        const result = await dbRunAsync(updateSql, finalParams);
         if (!result.changes) return res.status(400).json({ error: action === 'subtract' ? 'User not found or wallet has insufficient balance.' : 'User not found.' });
         await recordAdminAction(req.user.username, username, `wallet_${action}`, { wallet: column, amount: numericAmount });
         return res.json({ success: true, message: `Wallet updated successfully.` });
@@ -1753,11 +1785,18 @@ app.post('/api/admin/manual-credit', authenticateToken, adminOnly, async (req, r
             return res.status(404).json({ error: "User not found" });
         }
 
-        const result = await dbRunAsync(
-            `UPDATE users SET ${walletColumn} = COALESCE(${walletColumn}, 0) + ?
-             WHERE LOWER(username) = LOWER(?)`,
-            [numericAmount, username]
-        );
+        let updateSql, params;
+        if (walletColumn === 'balance') {
+            updateSql = `UPDATE users SET balance = COALESCE(balance, 0) + ?, wallet_balance = COALESCE(wallet_balance, 0) + ?
+                         WHERE LOWER(username) = LOWER(?)`;
+            params = [numericAmount, numericAmount, username];
+        } else {
+            updateSql = `UPDATE users SET ${walletColumn} = COALESCE(${walletColumn}, 0) + ?
+                         WHERE LOWER(username) = LOWER(?)`;
+            params = [numericAmount, username];
+        }
+
+        const result = await dbRunAsync(updateSql, params);
         if (!result.changes) {
             return res.status(400).json({ error: "User not found" });
         }
@@ -1998,14 +2037,20 @@ app.post('/api/admin/migrations/legacy-plans/run', authenticateToken, adminOnly,
             if (refundableCapital > 0) {
                 if (plan.user_id) {
                     await dbRunAsync(
-                        `UPDATE users SET wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE id = ?`,
-                        [refundableCapital, plan.user_id]
+                        `UPDATE users SET 
+                            balance = COALESCE(balance, 0) + ?,
+                            wallet_balance = COALESCE(wallet_balance, 0) + ?
+                         WHERE id = ?`,
+                        [refundableCapital, refundableCapital, plan.user_id]
                     );
                     impactedUserIds.add(Number(plan.user_id));
                 } else if (plan.username) {
                     await dbRunAsync(
-                        `UPDATE users SET wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE LOWER(username) = LOWER(?)`,
-                        [refundableCapital, plan.username]
+                        `UPDATE users SET 
+                            balance = COALESCE(balance, 0) + ?,
+                            wallet_balance = COALESCE(wallet_balance, 0) + ?
+                         WHERE LOWER(username) = LOWER(?)`,
+                        [refundableCapital, refundableCapital, plan.username]
                     );
                     impactedUsernames.add(String(plan.username));
                 }
@@ -2335,7 +2380,7 @@ function verifyPremiumAccess(username, cost, res, callback) {
         if (err || !user) return res.status(400).json({ error: "User not found" });
         if (user.planActivated !== 'true') return res.status(403).json({ error: "Premium Feature Locked. Please activate a plan." });
         if (user.balance < cost) return res.status(400).json({ error: "Insufficient balance." });
-        db.run(`UPDATE users SET balance = balance - ? WHERE LOWER(username) = LOWER(?) AND balance >= ?`, [cost, username, cost], function (updateErr) {
+        db.run(`UPDATE users SET balance = balance - ?, wallet_balance = wallet_balance - ? WHERE LOWER(username) = LOWER(?) AND balance >= ?`, [cost, cost, username, cost], function (updateErr) {
             if (updateErr) return res.status(500).json({ error: "Database error." });
             if (this.changes === 0) return res.status(400).json({ error: "Insufficient balance or user not found." });
             callback(user.balance - cost);
@@ -2426,11 +2471,12 @@ function processActiveInvestmentCycles() {
                 db.run(
                     `UPDATE users
                      SET balance = COALESCE(balance, 0) + ?,
+                         wallet_balance = COALESCE(wallet_balance, 0) + ?,
                          planActivated = 'false',
                          activePackage = 'None',
                          activePackageId = NULL
                      WHERE id = ? AND planActivated = 'true'`,
-                    [inv.capital, inv.user_id],
+                    [inv.capital, inv.capital, inv.user_id],
                     (userUpdateErr) => {
                         if (userUpdateErr) {
                             console.error(`Investment completion user update failed for ${inv.username}:`, userUpdateErr.message);
