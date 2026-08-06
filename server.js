@@ -200,6 +200,33 @@ function dbAllAsync(sql, params = []) {
     });
 }
 
+// Minimal SQLite busy-retry: re-run a DB operation when SQLite reports the
+// database is locked (SQLITE_BUSY), which can happen under concurrent writes.
+// This complements the connection-level busyTimeout configured at startup.
+const SQLITE_BUSY_RETRY_MAX_ATTEMPTS = 5;
+const SQLITE_BUSY_RETRY_BASE_DELAY_MS = 100;
+
+function isSqliteBusyError(err) {
+    return Boolean(err) && (err.code === 'SQLITE_BUSY' || err.errno === 5);
+}
+
+async function withSqliteBusyRetry(operation, label = 'sqlite') {
+    let attempt = 0;
+    for (;;) {
+        try {
+            return await operation();
+        } catch (err) {
+            attempt += 1;
+            if (!isSqliteBusyError(err) || attempt >= SQLITE_BUSY_RETRY_MAX_ATTEMPTS) {
+                throw err;
+            }
+            const delay = SQLITE_BUSY_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+            console.warn(`[DB] ${label} busy (attempt ${attempt}/${SQLITE_BUSY_RETRY_MAX_ATTEMPTS}), retrying in ${delay}ms`);
+            await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+    }
+}
+
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 15,
@@ -1284,19 +1311,22 @@ app.post('/api/request-deposit', authenticateToken, async (req, res) => {
 
         const userRow = await dbGetAsync(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [username]);
 
-        await dbRunAsync(
-            `INSERT INTO deposits (username, user_id, amount, sender_name, status, payment_method, transaction_ref, receipt, receipt_mime)
-             VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
-            [
-                username,
-                userRow ? userRow.id : null,
-                parseFloat(amount),
-                sender_name || username,
-                payment_method || 'bank_transfer',
-                transaction_ref || null,
-                receiptData,
-                receiptMime
-            ]
+        await withSqliteBusyRetry(
+            () => dbRunAsync(
+                `INSERT INTO deposits (username, user_id, amount, sender_name, status, payment_method, transaction_ref, receipt, receipt_mime)
+                 VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
+                [
+                    username,
+                    userRow ? userRow.id : null,
+                    parseFloat(amount),
+                    sender_name || username,
+                    payment_method || 'bank_transfer',
+                    transaction_ref || null,
+                    receiptData,
+                    receiptMime
+                ]
+            ),
+            'deposit_insert'
         );
 
         res.json({
