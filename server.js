@@ -190,18 +190,26 @@ function isSquadWebhookSignatureValid(req) {
     }
 }
 
+// Investment package earning structure (updated for a more attractive,
+// tiered ROI). Higher tiers earn a higher daily rate. Each entry's
+// daily_earning and total_payout MUST stay consistent with its daily_rate:
+//   daily_earning = capital * daily_rate
+//   total_payout  = capital + daily_earning * cycle_days
+// Existing ACTIVE investments keep the rate/earnings they were activated with
+// (snapshot on the user_investments row); these new values apply to fresh
+// activations and upgrades only.
 const FIXED_PACKAGES = [
-    { id: 'starter_basic', name: 'Starter Basic', tier: 'Starter', capital: 500, daily_rate: 0.01, cycle_days: 10, daily_earning: 5, total_payout: 550 },
-    { id: 'starter_bronze', name: 'Starter Bronze', tier: 'Starter', capital: 1500, daily_rate: 0.01, cycle_days: 10, daily_earning: 15, total_payout: 1650 },
-    { id: 'starter_silver', name: 'Starter Silver', tier: 'Starter', capital: 3000, daily_rate: 0.01, cycle_days: 10, daily_earning: 30, total_payout: 3300 },
-    { id: 'starter_gold', name: 'Starter Gold', tier: 'Starter', capital: 4500, daily_rate: 0.01, cycle_days: 10, daily_earning: 45, total_payout: 4950 },
-    { id: 'growth_plus', name: 'Growth Plus', tier: 'Growth', capital: 10000, daily_rate: 0.012, cycle_days: 15, daily_earning: 120, total_payout: 11800 },
-    { id: 'growth_pro', name: 'Growth Pro', tier: 'Growth', capital: 25000, daily_rate: 0.012, cycle_days: 15, daily_earning: 300, total_payout: 29500 },
-    { id: 'growth_max', name: 'Growth Max', tier: 'Growth', capital: 50000, daily_rate: 0.012, cycle_days: 15, daily_earning: 600, total_payout: 59000 },
-    { id: 'wealth_standard', name: 'Wealth Standard', tier: 'Wealth', capital: 100000, daily_rate: 0.014, cycle_days: 21, daily_earning: 1400, total_payout: 129400 },
-    { id: 'wealth_premium', name: 'Wealth Premium', tier: 'Wealth', capital: 250000, daily_rate: 0.014, cycle_days: 21, daily_earning: 3500, total_payout: 323500 },
-    { id: 'elite_vanguard', name: 'Elite Vanguard', tier: 'Elite', capital: 500000, daily_rate: 0.015, cycle_days: 30, daily_earning: 7500, total_payout: 725000 },
-    { id: 'elite_apex', name: 'Elite Apex', tier: 'Elite', capital: 1000000, daily_rate: 0.015, cycle_days: 30, daily_earning: 15000, total_payout: 1450000 }
+    { id: 'starter_basic', name: 'Starter Basic', tier: 'Starter', capital: 500, daily_rate: 0.03, cycle_days: 10, daily_earning: 15, total_payout: 650 },
+    { id: 'starter_bronze', name: 'Starter Bronze', tier: 'Starter', capital: 1500, daily_rate: 0.03, cycle_days: 10, daily_earning: 45, total_payout: 1950 },
+    { id: 'starter_silver', name: 'Starter Silver', tier: 'Starter', capital: 3000, daily_rate: 0.03, cycle_days: 10, daily_earning: 90, total_payout: 3900 },
+    { id: 'starter_gold', name: 'Starter Gold', tier: 'Starter', capital: 4500, daily_rate: 0.03, cycle_days: 10, daily_earning: 135, total_payout: 5850 },
+    { id: 'growth_plus', name: 'Growth Plus', tier: 'Growth', capital: 10000, daily_rate: 0.04, cycle_days: 15, daily_earning: 400, total_payout: 16000 },
+    { id: 'growth_pro', name: 'Growth Pro', tier: 'Growth', capital: 25000, daily_rate: 0.04, cycle_days: 15, daily_earning: 1000, total_payout: 40000 },
+    { id: 'growth_max', name: 'Growth Max', tier: 'Growth', capital: 50000, daily_rate: 0.04, cycle_days: 15, daily_earning: 2000, total_payout: 80000 },
+    { id: 'wealth_standard', name: 'Wealth Standard', tier: 'Wealth', capital: 100000, daily_rate: 0.05, cycle_days: 21, daily_earning: 5000, total_payout: 205000 },
+    { id: 'wealth_premium', name: 'Wealth Premium', tier: 'Wealth', capital: 250000, daily_rate: 0.05, cycle_days: 21, daily_earning: 12500, total_payout: 512500 },
+    { id: 'elite_vanguard', name: 'Elite Vanguard', tier: 'Elite', capital: 500000, daily_rate: 0.06, cycle_days: 30, daily_earning: 30000, total_payout: 1400000 },
+    { id: 'elite_apex', name: 'Elite Apex', tier: 'Elite', capital: 1000000, daily_rate: 0.06, cycle_days: 30, daily_earning: 60000, total_payout: 2800000 }
 ];
 
 const PACKAGE_BY_ID = FIXED_PACKAGES.reduce((acc, pkg) => {
