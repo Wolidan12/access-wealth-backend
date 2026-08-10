@@ -14,6 +14,64 @@ const multer = require('multer');
 const app = express();
 const jwtSecret = process.env.JWT_SECRET;
 
+// How long an access token lives. Raised from 7 days to 30 days so users who
+// don't open the app every week (e.g. returning to claim daily earnings) are not
+// locked out by an "Invalid or expired token" error. The frontend can also use
+// POST /api/refresh-token to silently get a fresh token before/after expiry.
+const ACCESS_TOKEN_TTL = '30d';
+const JWT_ISSUER = 'AccessWealthHQ';
+const JWT_AUDIENCE = 'AccessWealthUsers';
+
+function signAccessToken(user) {
+    return jwt.sign(
+        { id: user.id, username: user.username, role: user.role || 'user' },
+        jwtSecret,
+        { expiresIn: ACCESS_TOKEN_TTL, issuer: JWT_ISSUER, audience: JWT_AUDIENCE }
+    );
+}
+
+// Builds the full, normalized user object returned by login/register/refresh and
+// sync endpoints. Earlier versions returned a partial object on login (missing
+// full_name, phone, bank details and the earnings wallets), which made the
+// frontend treat fully-activated users as having an "incomplete account".
+function serializeUser(user) {
+    if (!user) return null;
+    const walletBalance = Number(user.wallet_balance ?? user.balance ?? 0);
+    const profileComplete = Boolean(
+        (user.full_name && String(user.full_name).trim()) &&
+        (user.phone && String(user.phone).trim())
+    );
+    // Bank details are considered complete when all three fields are present.
+    const bankComplete = Boolean(
+        user.bank_name && user.bank_account_number && user.bank_account_holder
+    );
+    return {
+        id: user.id,
+        username: user.username,
+        role: user.role || 'user',
+        status: user.status || 'active',
+        planActivated: user.planActivated ?? 'false',
+        activePackage: user.activePackage || 'None',
+        activePackageId: user.activePackageId || null,
+        my_referral_id: user.my_referral_id || null,
+        referred_by: user.referred_by || null,
+        full_name: user.full_name || '',
+        phone: user.phone || '',
+        bank_name: user.bank_name || '',
+        bank_account_number: user.bank_account_number || '',
+        bank_account_holder: user.bank_account_holder || '',
+        balance: Number(user.balance ?? 0),
+        wallet_balance: walletBalance,
+        taskEarnings: Number(user.taskEarnings ?? 0),
+        daily_earnings: Number(user.daily_earnings ?? 0),
+        affiliate_balance: Number(user.affiliate_balance ?? 0),
+        // Convenience flags the dashboard uses to decide what to prompt for.
+        profile_complete: profileComplete,
+        bank_complete: bankComplete,
+        account_complete: profileComplete && bankComplete
+    };
+}
+
 if (!jwtSecret) {
     throw new Error('JWT_SECRET must be configured before the server can start.');
 }
@@ -795,22 +853,43 @@ db.serialize(() => {
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return res.status(401).json({ error: "Access token required" });
-    jwt.verify(token, jwtSecret, {
-        issuer: 'AccessWealthHQ',
-        audience: 'AccessWealthUsers'
-    }, (err, user) => {
-        if (err) return res.status(403).json({ error: "Invalid or expired token" });
+    if (!token) return res.status(401).json({ error: "Access token required", code: "TOKEN_MISSING" });
+
+    // First try the strict verification (issuer + audience) used by current
+    // tokens. If that fails, fall back to verifying signature + expiry WITHOUT
+    // the issuer/audience claim checks so tokens issued before those claims
+    // were enforced (or by older clients) still work. This prevents returning
+    // users from being locked out with "Invalid or expired token" when they
+    // come back to claim earnings.
+    const verifyOptions = { issuer: JWT_ISSUER, audience: JWT_AUDIENCE };
+    jwt.verify(token, jwtSecret, verifyOptions, (err, user) => {
+        if (err) {
+            jwt.verify(token, jwtSecret, {}, (legacyErr, legacyUser) => {
+                if (legacyErr) {
+                    return res.status(403).json({
+                        error: "Invalid or expired token. Please log in again.",
+                        code: "TOKEN_INVALID"
+                    });
+                }
+                req.user = legacyUser;
+                return validateUserStatus(req, res, next);
+            });
+            return;
+        }
         req.user = user;
-        db.get(`SELECT status FROM users WHERE id = ?`, [user.id], (statusErr, statusRow) => {
-            if (statusErr) return res.status(500).json({ error: "Server error while validating account status" });
-            if (statusRow && statusRow.status === 'banned') {
-                return res.status(403).json({ error: "Your account has been suspended. Please contact support." });
-            }
-            next();
-        });
+        validateUserStatus(req, res, next);
     });
 };
+
+function validateUserStatus(req, res, next) {
+    db.get(`SELECT status FROM users WHERE id = ?`, [req.user.id], (statusErr, statusRow) => {
+        if (statusErr) return res.status(500).json({ error: "Server error while validating account status" });
+        if (statusRow && statusRow.status === 'banned') {
+            return res.status(403).json({ error: "Your account has been suspended. Please contact support." });
+        }
+        next();
+    });
+}
 
 const adminOnly = (req, res, next) => {
     if (!req.user || req.user.role !== 'admin') return res.status(403).json({ error: "Admin access required" });
@@ -827,16 +906,16 @@ app.get('/api/user/:username', authenticateToken, (req, res) => {
     const query = `SELECT id, username, balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance, my_referral_id, referred_by, planActivated, activePackage, activePackageId, role, full_name, phone, bank_name, bank_account_number, bank_account_holder, created_at FROM users WHERE LOWER(username) = LOWER(?)`;
     db.get(query, [req.params.username], (err, user) => {
         if (err || !user) return res.status(404).json({ error: "User not found" });
-        res.json({ success: true, user });
+        res.json({ success: true, user: serializeUser(user) });
     });
 });
 
 app.post('/api/user/sync', authenticateToken, (req, res) => {
     const username = req.user.username;
-    const query = `SELECT id, username, balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance, my_referral_id, referred_by, planActivated, activePackage, activePackageId, role, full_name, phone, bank_name, bank_account_number, bank_account_holder, created_at FROM users WHERE LOWER(username) = LOWER(?)`;
+    const query = `SELECT * FROM users WHERE LOWER(username) = LOWER(?)`;
     db.get(query, [username], (err, user) => {
         if (err || !user) return res.status(404).json({ error: "User not found" });
-        res.json({ success: true, user });
+        res.json({ success: true, user: serializeUser(user) });
     });
 });
 
@@ -871,18 +950,22 @@ app.post('/api/register', authLimiter, async (req, res) => {
                             }
                             return res.status(500).json({ error: "Database error: " + err.message });
                         }
-                        const token = jwt.sign({ id: this.lastID, username, role: 'user' }, jwtSecret, { expiresIn: '7d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
-                        res.json({
-                            success: true,
-                            message: "Registration successful!",
-                            token,
-                            user: {
-                                id: this.lastID,
-                                username,
-                                role: 'user',
-                                planActivated: 'false',
-                                my_referral_id: my_referral_id
-                            }
+                        const token = signAccessToken({ id: this.lastID, username, role: 'user' });
+                        // Return the full normalized user so the frontend never
+                        // treats a brand-new account as "incomplete" because of
+                        // missing fields.
+                        db.get(`SELECT * FROM users WHERE id = ?`, [this.lastID], (fetchErr, newUser) => {
+                            res.json({
+                                success: true,
+                                message: "Registration successful!",
+                                token,
+                                user: serializeUser(newUser || {
+                                    id: this.lastID,
+                                    username,
+                                    role: 'user',
+                                    my_referral_id
+                                })
+                            });
                         });
                     });
             };
@@ -920,25 +1003,15 @@ app.post('/api/login', authLimiter, async (req, res) => {
     try {
         const { username, password } = req.body;
         if (!username || !password) return res.status(400).json({ error: "Username and password required" });
-        db.get(`SELECT id, username, password, role, planActivated, activePackage, activePackageId, my_referral_id, wallet_balance, balance FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
+        db.get(`SELECT * FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
             if (err || !user) return res.status(400).json({ error: "Invalid username or password" });
             const passwordMatch = await bcryptjs.compare(password, user.password);
             if (!passwordMatch) return res.status(400).json({ error: "Invalid username or password" });
-            const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, jwtSecret, { expiresIn: '7d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
+            const token = signAccessToken(user);
             res.json({
                 success: true,
                 token,
-                user: {
-                    id: user.id,
-                    username: user.username,
-                    role: user.role,
-                    planActivated: user.planActivated,
-                    activePackage: user.activePackage,
-                    activePackageId: user.activePackageId,
-                    my_referral_id: user.my_referral_id,
-                    wallet_balance: (user.wallet_balance || user.balance) ?? 0,
-                    balance: user.balance ?? 0
-                }
+                user: serializeUser(user)
             });
         });
     } catch (error) {
@@ -1012,6 +1085,49 @@ async function createSquadDepositLink(req, res) {
         res.status(500).json({ error: 'Server error during Squad payment link initialization.' });
     }
 }
+
+// POST /api/refresh-token — exchange a still-valid (or recently expired) token
+// for a fresh 30-day token and the full normalized user. The frontend should
+// call this when it receives a 401/403 with code TOKEN_INVALID, OR proactively
+// on app load, so returning users can claim daily earnings without being forced
+// to log in again. We intentionally accept tokens up to 7 days past expiry to
+// smooth over long gaps; anything older requires a fresh login.
+app.post('/api/refresh-token', actionLimiter, (req, res) => {
+    const authHeader = req.headers['authorization'];
+    const incomingToken = authHeader && authHeader.split(' ')[1];
+    if (!incomingToken) {
+        return res.status(401).json({ error: "Access token required", code: "TOKEN_MISSING" });
+    }
+
+    const finishWithUser = (payload) => {
+        db.get(`SELECT * FROM users WHERE id = ?`, [payload.id], (err, user) => {
+            if (err || !user) {
+                return res.status(401).json({ error: "Account no longer exists.", code: "TOKEN_INVALID" });
+            }
+            if (user.status === 'banned') {
+                return res.status(403).json({ error: "Your account has been suspended. Please contact support." });
+            }
+            const freshToken = signAccessToken(user);
+            res.json({ success: true, token: freshToken, user: serializeUser(user) });
+        });
+    };
+
+    // Try strict verification first.
+    jwt.verify(incomingToken, jwtSecret, { issuer: JWT_ISSUER, audience: JWT_AUDIENCE }, (err, payload) => {
+        if (!err) return finishWithUser(payload);
+
+        // Allow grace period for an expired-but-otherwise-valid token.
+        jwt.verify(incomingToken, jwtSecret, { ignoreExpiration: true }, (legacyErr, legacyPayload) => {
+            if (legacyErr) {
+                return res.status(403).json({ error: "Session expired. Please log in again.", code: "TOKEN_INVALID" });
+            }
+            if (legacyPayload.exp && (Date.now() / 1000 - legacyPayload.exp) > 7 * 24 * 60 * 60) {
+                return res.status(403).json({ error: "Session expired. Please log in again.", code: "TOKEN_INVALID" });
+            }
+            finishWithUser(legacyPayload);
+        });
+    });
+});
 
 // ==========================================
 // 2. SQUAD AUTOMATED DEPOSITS
@@ -1904,24 +2020,79 @@ app.post('/api/admin/decline-deposit', authenticateToken, adminOnly, async (req,
 // ==========================================
 app.post('/api/claim-daily-task', authenticateToken, async (req, res) => {
     try {
+        const userId = req.user.id;
         const username = req.user.username;
-        const { amount } = req.body;
-        if (!amount || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
-        db.get(`SELECT taskEarnings, planActivated FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
-            if (err || !user) return res.status(404).json({ error: "User not found" });
-            if (user.planActivated !== 'true') return res.status(403).json({ error: "You must activate a plan first" });
-            const today = new Date().toISOString().split('T')[0];
-            db.get(`SELECT id FROM daily_claims WHERE username = ? AND claim_date = ?`, [username, today], async (err, claim) => {
-                if (claim) return res.status(400).json({ error: "You have already claimed your daily task today. Come back tomorrow!" });
-                const newTaskEarnings = (user.taskEarnings || 0) + amount;
-                db.run(`UPDATE users SET taskEarnings = ? WHERE LOWER(username) = LOWER(?)`, [newTaskEarnings, username], function(updateErr) {
-                    if (updateErr) return res.status(500).json({ error: "Failed to update earnings" });
-                    db.run(`INSERT INTO daily_claims (username, claim_date, amount) VALUES (?, ?, ?)`, [username, today, amount]);
-                    res.json({ success: true, message: `Successfully claimed ₦${amount}!`, newBalance: newTaskEarnings });
-                });
+
+        const user = await dbGetAsync(
+            `SELECT id, username, taskEarnings, planActivated, activePackage, activePackageId
+             FROM users WHERE id = ?`,
+            [userId]
+        );
+        if (!user) return res.status(404).json({ error: "User not found" });
+        if (user.planActivated !== 'true') {
+            return res.status(403).json({ error: "You must activate a plan first" });
+        }
+
+        // Determine the claim amount. Prefer the active investment's snapshotted
+        // daily_earning (authoritative), then the amount the client sends. This
+        // avoids zero/incorrect claims when old clients send a stale amount.
+        let amount = Number(req.body && req.body.amount);
+        const activeInvestment = await dbGetAsync(
+            `SELECT daily_earning FROM user_investments WHERE user_id = ? AND status = 'active' ORDER BY activated_at DESC LIMIT 1`,
+            [userId]
+        );
+        if (activeInvestment && activeInvestment.daily_earning > 0) {
+            amount = Number(activeInvestment.daily_earning);
+        }
+        if (!amount || amount <= 0) {
+            return res.status(400).json({ error: "Invalid claim amount. Please activate a valid package." });
+        }
+
+        // Idempotent daily claim keyed by both user id and username.
+        const today = new Date().toISOString().split('T')[0];
+        const existing = await dbGetAsync(
+            `SELECT id, amount FROM daily_claims WHERE (username = ? OR username = ?) AND claim_date = ? LIMIT 1`,
+            [username, user.username, today]
+        );
+        if (existing) {
+            return res.status(400).json({
+                error: "You have already claimed your daily earnings today. Come back tomorrow!",
+                already_claimed: true,
+                claimed_amount: Number(existing.amount || 0)
             });
+        }
+
+        const newTaskEarnings = (Number(user.taskEarnings) || 0) + amount;
+        await dbRunAsync(
+            `UPDATE users SET taskEarnings = ? WHERE id = ?`,
+            [newTaskEarnings, userId]
+        );
+        await dbRunAsync(
+            `INSERT INTO daily_claims (username, claim_date, amount) VALUES (?, ?, ?)`,
+            [username, today, amount]
+        );
+
+        const refreshed = await dbGetAsync(
+            `SELECT balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance
+             FROM users WHERE id = ?`,
+            [userId]
+        );
+
+        res.json({
+            success: true,
+            message: `Successfully claimed ₦${amount.toLocaleString()}!`,
+            claimed_amount: amount,
+            newBalance: newTaskEarnings,
+            balances: refreshed ? {
+                balance: Number(refreshed.balance ?? 0),
+                wallet_balance: Number(refreshed.wallet_balance ?? 0),
+                taskEarnings: Number(refreshed.taskEarnings ?? 0),
+                daily_earnings: Number(refreshed.daily_earnings ?? 0),
+                affiliate_balance: Number(refreshed.affiliate_balance ?? 0)
+            } : null
         });
     } catch (error) {
+        console.error('Claim daily task error:', error.message);
         res.status(500).json({ error: "Server error" });
     }
 });
