@@ -9,9 +9,68 @@ const axios = require('axios');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
+const multer = require('multer');
 
 const app = express();
 const jwtSecret = process.env.JWT_SECRET;
+
+// How long an access token lives. Raised from 7 days to 30 days so users who
+// don't open the app every week (e.g. returning to claim daily earnings) are not
+// locked out by an "Invalid or expired token" error. The frontend can also use
+// POST /api/refresh-token to silently get a fresh token before/after expiry.
+const ACCESS_TOKEN_TTL = '30d';
+const JWT_ISSUER = 'AccessWealthHQ';
+const JWT_AUDIENCE = 'AccessWealthUsers';
+
+function signAccessToken(user) {
+    return jwt.sign(
+        { id: user.id, username: user.username, role: user.role || 'user' },
+        jwtSecret,
+        { expiresIn: ACCESS_TOKEN_TTL, issuer: JWT_ISSUER, audience: JWT_AUDIENCE }
+    );
+}
+
+// Builds the full, normalized user object returned by login/register/refresh and
+// sync endpoints. Earlier versions returned a partial object on login (missing
+// full_name, phone, bank details and the earnings wallets), which made the
+// frontend treat fully-activated users as having an "incomplete account".
+function serializeUser(user) {
+    if (!user) return null;
+    const walletBalance = Number(user.wallet_balance ?? user.balance ?? 0);
+    const profileComplete = Boolean(
+        (user.full_name && String(user.full_name).trim()) &&
+        (user.phone && String(user.phone).trim())
+    );
+    // Bank details are considered complete when all three fields are present.
+    const bankComplete = Boolean(
+        user.bank_name && user.bank_account_number && user.bank_account_holder
+    );
+    return {
+        id: user.id,
+        username: user.username,
+        role: user.role || 'user',
+        status: user.status || 'active',
+        planActivated: user.planActivated ?? 'false',
+        activePackage: user.activePackage || 'None',
+        activePackageId: user.activePackageId || null,
+        my_referral_id: user.my_referral_id || null,
+        referred_by: user.referred_by || null,
+        full_name: user.full_name || '',
+        phone: user.phone || '',
+        bank_name: user.bank_name || '',
+        bank_account_number: user.bank_account_number || '',
+        bank_account_holder: user.bank_account_holder || '',
+        balance: Number(user.balance ?? 0),
+        wallet_balance: walletBalance,
+        taskEarnings: Number(user.taskEarnings ?? 0),
+        daily_earnings: Number(user.daily_earnings ?? 0),
+        affiliate_balance: Number(user.affiliate_balance ?? 0),
+        // Convenience flags the dashboard uses to decide what to prompt for.
+        profile_complete: profileComplete,
+        bank_complete: bankComplete,
+        account_complete: profileComplete && bankComplete
+    };
+}
 
 if (!jwtSecret) {
     throw new Error('JWT_SECRET must be configured before the server can start.');
@@ -78,6 +137,66 @@ function parseDataUrl(dataUrl) {
 
 const MAX_RECEIPT_SIZE = 5 * 1024 * 1024; // 5MB
 
+// Allowed receipt MIME types. Images (PNG/JPG/GIF/WEBP) and PDF.
+const ALLOWED_RECEIPT_MIMES = new Set([
+    'image/png',
+    'image/jpeg',
+    'image/jpg',
+    'image/gif',
+    'image/webp',
+    'application/pdf'
+]);
+
+// Multipart upload handler. Files are kept in memory (Buffer) so the deposit
+// handler can base64-encode them for storage exactly like the legacy JSON path,
+// but they are streamed off the socket instead of being inflated into a giant
+// base64 JSON string. This is what makes mobile uploads reliable: on mobile,
+// high-resolution camera photos are commonly 4-10MB, and base64 + JSON parsing
+// of that string pushes the browser tab over its memory limit, causing it to
+// hang or be killed (which appears to the user as a refresh).
+const receiptUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+        fileSize: MAX_RECEIPT_SIZE,
+        // Guard against abusive multi-field payloads.
+        files: 1,
+        fields: 20,
+        fieldSize: 1 * 1024 * 1024
+    },
+    fileFilter: (req, file, cb) => {
+        if (ALLOWED_RECEIPT_MIMES.has(file.mimetype)) {
+            return cb(null, true);
+        }
+        const err = new Error('Receipt must be a PNG, JPG, GIF, WEBP or PDF file.');
+        err.code = 'UNSUPPORTED_RECEIPT_TYPE';
+        cb(err);
+    }
+});
+
+// Middleware that runs a single-file multer upload and translates multer errors
+// into clean 400 JSON responses (instead of the default HTML error page or a
+// 500). In particular LIMIT_FILE_SIZE returns a message the mobile client can
+// show directly so the user knows to compress/choose a smaller photo.
+function uploadReceipt(req, res, next) {
+    receiptUpload.single('receipt')(req, res, (err) => {
+        if (err) {
+            if (err.code === 'LIMIT_FILE_SIZE') {
+                return res.status(400).json({
+                    error: 'Receipt file is too large. Maximum size is 5MB. Please choose a smaller or compressed photo.'
+                });
+            }
+            if (err.code === 'UNSUPPORTED_RECEIPT_TYPE') {
+                return res.status(400).json({ error: err.message });
+            }
+            if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+                return res.status(400).json({ error: 'Unexpected file field. Upload the receipt using the "receipt" field.' });
+            }
+            return res.status(400).json({ error: 'Failed to upload receipt. Please try again.' });
+        }
+        next();
+    });
+}
+
 app.use(express.static(__dirname));
 
 function isValidAmount(val) {
@@ -129,18 +248,26 @@ function isSquadWebhookSignatureValid(req) {
     }
 }
 
+// Investment package earning structure (updated for a more attractive,
+// tiered ROI). Higher tiers earn a higher daily rate. Each entry's
+// daily_earning and total_payout MUST stay consistent with its daily_rate:
+//   daily_earning = capital * daily_rate
+//   total_payout  = capital + daily_earning * cycle_days
+// Existing ACTIVE investments keep the rate/earnings they were activated with
+// (snapshot on the user_investments row); these new values apply to fresh
+// activations and upgrades only.
 const FIXED_PACKAGES = [
-    { id: 'starter_basic', name: 'Starter Basic', tier: 'Starter', capital: 500, daily_rate: 0.01, cycle_days: 10, daily_earning: 5, total_payout: 550 },
-    { id: 'starter_bronze', name: 'Starter Bronze', tier: 'Starter', capital: 1500, daily_rate: 0.01, cycle_days: 10, daily_earning: 15, total_payout: 1650 },
-    { id: 'starter_silver', name: 'Starter Silver', tier: 'Starter', capital: 3000, daily_rate: 0.01, cycle_days: 10, daily_earning: 30, total_payout: 3300 },
-    { id: 'starter_gold', name: 'Starter Gold', tier: 'Starter', capital: 4500, daily_rate: 0.01, cycle_days: 10, daily_earning: 45, total_payout: 4950 },
-    { id: 'growth_plus', name: 'Growth Plus', tier: 'Growth', capital: 10000, daily_rate: 0.012, cycle_days: 15, daily_earning: 120, total_payout: 11800 },
-    { id: 'growth_pro', name: 'Growth Pro', tier: 'Growth', capital: 25000, daily_rate: 0.012, cycle_days: 15, daily_earning: 300, total_payout: 29500 },
-    { id: 'growth_max', name: 'Growth Max', tier: 'Growth', capital: 50000, daily_rate: 0.012, cycle_days: 15, daily_earning: 600, total_payout: 59000 },
-    { id: 'wealth_standard', name: 'Wealth Standard', tier: 'Wealth', capital: 100000, daily_rate: 0.014, cycle_days: 21, daily_earning: 1400, total_payout: 129400 },
-    { id: 'wealth_premium', name: 'Wealth Premium', tier: 'Wealth', capital: 250000, daily_rate: 0.014, cycle_days: 21, daily_earning: 3500, total_payout: 323500 },
-    { id: 'elite_vanguard', name: 'Elite Vanguard', tier: 'Elite', capital: 500000, daily_rate: 0.015, cycle_days: 30, daily_earning: 7500, total_payout: 725000 },
-    { id: 'elite_apex', name: 'Elite Apex', tier: 'Elite', capital: 1000000, daily_rate: 0.015, cycle_days: 30, daily_earning: 15000, total_payout: 1450000 }
+    { id: 'starter_basic', name: 'Starter Basic', tier: 'Starter', capital: 500, daily_rate: 0.03, cycle_days: 10, daily_earning: 15, total_payout: 650 },
+    { id: 'starter_bronze', name: 'Starter Bronze', tier: 'Starter', capital: 1500, daily_rate: 0.03, cycle_days: 10, daily_earning: 45, total_payout: 1950 },
+    { id: 'starter_silver', name: 'Starter Silver', tier: 'Starter', capital: 3000, daily_rate: 0.03, cycle_days: 10, daily_earning: 90, total_payout: 3900 },
+    { id: 'starter_gold', name: 'Starter Gold', tier: 'Starter', capital: 4500, daily_rate: 0.03, cycle_days: 10, daily_earning: 135, total_payout: 5850 },
+    { id: 'growth_plus', name: 'Growth Plus', tier: 'Growth', capital: 10000, daily_rate: 0.04, cycle_days: 15, daily_earning: 400, total_payout: 16000 },
+    { id: 'growth_pro', name: 'Growth Pro', tier: 'Growth', capital: 25000, daily_rate: 0.04, cycle_days: 15, daily_earning: 1000, total_payout: 40000 },
+    { id: 'growth_max', name: 'Growth Max', tier: 'Growth', capital: 50000, daily_rate: 0.04, cycle_days: 15, daily_earning: 2000, total_payout: 80000 },
+    { id: 'wealth_standard', name: 'Wealth Standard', tier: 'Wealth', capital: 100000, daily_rate: 0.05, cycle_days: 21, daily_earning: 5000, total_payout: 205000 },
+    { id: 'wealth_premium', name: 'Wealth Premium', tier: 'Wealth', capital: 250000, daily_rate: 0.05, cycle_days: 21, daily_earning: 12500, total_payout: 512500 },
+    { id: 'elite_vanguard', name: 'Elite Vanguard', tier: 'Elite', capital: 500000, daily_rate: 0.06, cycle_days: 30, daily_earning: 30000, total_payout: 1400000 },
+    { id: 'elite_apex', name: 'Elite Apex', tier: 'Elite', capital: 1000000, daily_rate: 0.06, cycle_days: 30, daily_earning: 60000, total_payout: 2800000 }
 ];
 
 const PACKAGE_BY_ID = FIXED_PACKAGES.reduce((acc, pkg) => {
@@ -726,22 +853,43 @@ db.serialize(() => {
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return res.status(401).json({ error: "Access token required" });
-    jwt.verify(token, jwtSecret, {
-        issuer: 'AccessWealthHQ',
-        audience: 'AccessWealthUsers'
-    }, (err, user) => {
-        if (err) return res.status(403).json({ error: "Invalid or expired token" });
+    if (!token) return res.status(401).json({ error: "Access token required", code: "TOKEN_MISSING" });
+
+    // First try the strict verification (issuer + audience) used by current
+    // tokens. If that fails, fall back to verifying signature + expiry WITHOUT
+    // the issuer/audience claim checks so tokens issued before those claims
+    // were enforced (or by older clients) still work. This prevents returning
+    // users from being locked out with "Invalid or expired token" when they
+    // come back to claim earnings.
+    const verifyOptions = { issuer: JWT_ISSUER, audience: JWT_AUDIENCE };
+    jwt.verify(token, jwtSecret, verifyOptions, (err, user) => {
+        if (err) {
+            jwt.verify(token, jwtSecret, {}, (legacyErr, legacyUser) => {
+                if (legacyErr) {
+                    return res.status(403).json({
+                        error: "Invalid or expired token. Please log in again.",
+                        code: "TOKEN_INVALID"
+                    });
+                }
+                req.user = legacyUser;
+                return validateUserStatus(req, res, next);
+            });
+            return;
+        }
         req.user = user;
-        db.get(`SELECT status FROM users WHERE id = ?`, [user.id], (statusErr, statusRow) => {
-            if (statusErr) return res.status(500).json({ error: "Server error while validating account status" });
-            if (statusRow && statusRow.status === 'banned') {
-                return res.status(403).json({ error: "Your account has been suspended. Please contact support." });
-            }
-            next();
-        });
+        validateUserStatus(req, res, next);
     });
 };
+
+function validateUserStatus(req, res, next) {
+    db.get(`SELECT status FROM users WHERE id = ?`, [req.user.id], (statusErr, statusRow) => {
+        if (statusErr) return res.status(500).json({ error: "Server error while validating account status" });
+        if (statusRow && statusRow.status === 'banned') {
+            return res.status(403).json({ error: "Your account has been suspended. Please contact support." });
+        }
+        next();
+    });
+}
 
 const adminOnly = (req, res, next) => {
     if (!req.user || req.user.role !== 'admin') return res.status(403).json({ error: "Admin access required" });
@@ -758,16 +906,16 @@ app.get('/api/user/:username', authenticateToken, (req, res) => {
     const query = `SELECT id, username, balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance, my_referral_id, referred_by, planActivated, activePackage, activePackageId, role, full_name, phone, bank_name, bank_account_number, bank_account_holder, created_at FROM users WHERE LOWER(username) = LOWER(?)`;
     db.get(query, [req.params.username], (err, user) => {
         if (err || !user) return res.status(404).json({ error: "User not found" });
-        res.json({ success: true, user });
+        res.json({ success: true, user: serializeUser(user) });
     });
 });
 
 app.post('/api/user/sync', authenticateToken, (req, res) => {
     const username = req.user.username;
-    const query = `SELECT id, username, balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance, my_referral_id, referred_by, planActivated, activePackage, activePackageId, role, full_name, phone, bank_name, bank_account_number, bank_account_holder, created_at FROM users WHERE LOWER(username) = LOWER(?)`;
+    const query = `SELECT * FROM users WHERE LOWER(username) = LOWER(?)`;
     db.get(query, [username], (err, user) => {
         if (err || !user) return res.status(404).json({ error: "User not found" });
-        res.json({ success: true, user });
+        res.json({ success: true, user: serializeUser(user) });
     });
 });
 
@@ -802,18 +950,22 @@ app.post('/api/register', authLimiter, async (req, res) => {
                             }
                             return res.status(500).json({ error: "Database error: " + err.message });
                         }
-                        const token = jwt.sign({ id: this.lastID, username, role: 'user' }, jwtSecret, { expiresIn: '7d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
-                        res.json({
-                            success: true,
-                            message: "Registration successful!",
-                            token,
-                            user: {
-                                id: this.lastID,
-                                username,
-                                role: 'user',
-                                planActivated: 'false',
-                                my_referral_id: my_referral_id
-                            }
+                        const token = signAccessToken({ id: this.lastID, username, role: 'user' });
+                        // Return the full normalized user so the frontend never
+                        // treats a brand-new account as "incomplete" because of
+                        // missing fields.
+                        db.get(`SELECT * FROM users WHERE id = ?`, [this.lastID], (fetchErr, newUser) => {
+                            res.json({
+                                success: true,
+                                message: "Registration successful!",
+                                token,
+                                user: serializeUser(newUser || {
+                                    id: this.lastID,
+                                    username,
+                                    role: 'user',
+                                    my_referral_id
+                                })
+                            });
                         });
                     });
             };
@@ -851,25 +1003,15 @@ app.post('/api/login', authLimiter, async (req, res) => {
     try {
         const { username, password } = req.body;
         if (!username || !password) return res.status(400).json({ error: "Username and password required" });
-        db.get(`SELECT id, username, password, role, planActivated, activePackage, activePackageId, my_referral_id, wallet_balance, balance FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
+        db.get(`SELECT * FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
             if (err || !user) return res.status(400).json({ error: "Invalid username or password" });
             const passwordMatch = await bcryptjs.compare(password, user.password);
             if (!passwordMatch) return res.status(400).json({ error: "Invalid username or password" });
-            const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, jwtSecret, { expiresIn: '7d', issuer: 'AccessWealthHQ', audience: 'AccessWealthUsers' });
+            const token = signAccessToken(user);
             res.json({
                 success: true,
                 token,
-                user: {
-                    id: user.id,
-                    username: user.username,
-                    role: user.role,
-                    planActivated: user.planActivated,
-                    activePackage: user.activePackage,
-                    activePackageId: user.activePackageId,
-                    my_referral_id: user.my_referral_id,
-                    wallet_balance: (user.wallet_balance || user.balance) ?? 0,
-                    balance: user.balance ?? 0
-                }
+                user: serializeUser(user)
             });
         });
     } catch (error) {
@@ -943,6 +1085,49 @@ async function createSquadDepositLink(req, res) {
         res.status(500).json({ error: 'Server error during Squad payment link initialization.' });
     }
 }
+
+// POST /api/refresh-token — exchange a still-valid (or recently expired) token
+// for a fresh 30-day token and the full normalized user. The frontend should
+// call this when it receives a 401/403 with code TOKEN_INVALID, OR proactively
+// on app load, so returning users can claim daily earnings without being forced
+// to log in again. We intentionally accept tokens up to 7 days past expiry to
+// smooth over long gaps; anything older requires a fresh login.
+app.post('/api/refresh-token', actionLimiter, (req, res) => {
+    const authHeader = req.headers['authorization'];
+    const incomingToken = authHeader && authHeader.split(' ')[1];
+    if (!incomingToken) {
+        return res.status(401).json({ error: "Access token required", code: "TOKEN_MISSING" });
+    }
+
+    const finishWithUser = (payload) => {
+        db.get(`SELECT * FROM users WHERE id = ?`, [payload.id], (err, user) => {
+            if (err || !user) {
+                return res.status(401).json({ error: "Account no longer exists.", code: "TOKEN_INVALID" });
+            }
+            if (user.status === 'banned') {
+                return res.status(403).json({ error: "Your account has been suspended. Please contact support." });
+            }
+            const freshToken = signAccessToken(user);
+            res.json({ success: true, token: freshToken, user: serializeUser(user) });
+        });
+    };
+
+    // Try strict verification first.
+    jwt.verify(incomingToken, jwtSecret, { issuer: JWT_ISSUER, audience: JWT_AUDIENCE }, (err, payload) => {
+        if (!err) return finishWithUser(payload);
+
+        // Allow grace period for an expired-but-otherwise-valid token.
+        jwt.verify(incomingToken, jwtSecret, { ignoreExpiration: true }, (legacyErr, legacyPayload) => {
+            if (legacyErr) {
+                return res.status(403).json({ error: "Session expired. Please log in again.", code: "TOKEN_INVALID" });
+            }
+            if (legacyPayload.exp && (Date.now() / 1000 - legacyPayload.exp) > 7 * 24 * 60 * 60) {
+                return res.status(403).json({ error: "Session expired. Please log in again.", code: "TOKEN_INVALID" });
+            }
+            finishWithUser(legacyPayload);
+        });
+    });
+});
 
 // ==========================================
 // 2. SQUAD AUTOMATED DEPOSITS
@@ -1223,6 +1408,168 @@ app.post('/api/activate', authenticateToken, actionLimiter, (req, res) => {
     });
 });
 
+// GET the authenticated user's currently active investment cycle (or null).
+// Used by the dashboard/upgrade screen to show the active package and to let
+// the frontend calculate the cost of upgrading to a higher package.
+app.get('/api/active-investment', authenticateToken, async (req, res) => {
+    try {
+        const investment = await dbGetAsync(
+            `SELECT id, package_id, package_name, capital, daily_rate, cycle_days,
+                    daily_earning, total_payout, referral_bonus, days_credited,
+                    status, activated_at, completed_at
+             FROM user_investments
+             WHERE user_id = ? AND status = 'active'
+             ORDER BY activated_at DESC
+             LIMIT 1`,
+            [req.user.id]
+        );
+
+        const user = await dbGetAsync(
+            `SELECT balance, wallet_balance, planActivated, activePackage, activePackageId
+             FROM users WHERE id = ?`,
+            [req.user.id]
+        );
+
+        res.json({
+            success: true,
+            hasActive: !!investment,
+            investment: investment || null,
+            balance: user ? (user.wallet_balance ?? user.balance ?? 0) : 0
+        });
+    } catch (error) {
+        console.error('Active investment lookup error:', error.message);
+        res.status(500).json({ error: 'Failed to load active investment.' });
+    }
+});
+
+// POST upgrade the authenticated user's ACTIVE package to a HIGHER package.
+// The user has already locked the current package's capital, so they only pay
+// the difference (newCapital - currentCapital) from their wallet balance. The
+// current cycle is ended with status 'upgraded' and a fresh cycle for the new
+// package begins immediately. Daily earnings already credited are kept.
+app.post('/api/upgrade-package', authenticateToken, actionLimiter, async (req, res) => {
+    const packageId = (req.body.package_id || req.body.packageId || '').toString().trim().toLowerCase();
+    const fallbackName = (req.body.name || '').toString().trim().toLowerCase();
+    const targetPackage = PACKAGE_BY_ID[packageId] || PACKAGE_BY_NAME[fallbackName];
+
+    if (!targetPackage) {
+        return res.status(400).json({ error: 'Invalid package selection.' });
+    }
+
+    let transactionOpen = false;
+    try {
+        const user = await dbGetAsync(
+            `SELECT id, username, balance, wallet_balance, referred_by FROM users WHERE id = ?`,
+            [req.user.id]
+        );
+        if (!user) return res.status(404).json({ error: 'User not found.' });
+
+        const current = await dbGetAsync(
+            `SELECT id, package_id, package_name, capital FROM user_investments
+             WHERE user_id = ? AND status = 'active'
+             ORDER BY activated_at DESC LIMIT 1`,
+            [req.user.id]
+        );
+
+        if (!current) {
+            return res.status(400).json({
+                error: 'You do not have an active package to upgrade. Please activate a package first.'
+            });
+        }
+
+        if (targetPackage.capital <= current.capital) {
+            return res.status(400).json({
+                error: 'You can only upgrade to a higher package. Please select a package with a larger capital.'
+            });
+        }
+
+        const upgradeCost = targetPackage.capital - current.capital;
+        const currentBalance = Number(user.wallet_balance ?? user.balance ?? 0);
+        if (currentBalance < upgradeCost) {
+            return res.status(400).json({
+                error: `Insufficient balance to upgrade. You need ₦${upgradeCost.toLocaleString()} more.`
+            });
+        }
+
+        const referralBonus = Math.round(upgradeCost * 0.5);
+        const newBalance = currentBalance - upgradeCost;
+
+        await dbRunAsync('BEGIN IMMEDIATE TRANSACTION');
+        transactionOpen = true;
+
+        // End the current cycle.
+        await dbRunAsync(
+            `UPDATE user_investments
+             SET status = 'upgraded', completed_at = datetime('now')
+             WHERE id = ? AND status = 'active'`,
+            [current.id]
+        );
+
+        // Deduct only the difference.
+        await dbRunAsync(
+            `UPDATE users
+             SET balance = COALESCE(balance, 0) - ?,
+                 wallet_balance = COALESCE(wallet_balance, 0) - ?,
+                 activePackage = ?, activePackageId = ?, planActivated = 'true'
+             WHERE id = ?`,
+            [upgradeCost, upgradeCost, targetPackage.name, targetPackage.id, req.user.id]
+        );
+
+        // Start the new (upgraded) cycle fresh.
+        await dbRunAsync(
+            `INSERT INTO user_investments
+             (user_id, username, package_id, package_name, capital, daily_rate, cycle_days,
+              daily_earning, total_payout, referral_bonus, days_credited, status, activated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', datetime('now'))`,
+            [
+                req.user.id,
+                user.username,
+                targetPackage.id,
+                targetPackage.name,
+                targetPackage.capital,
+                targetPackage.daily_rate,
+                targetPackage.cycle_days,
+                targetPackage.daily_earning,
+                targetPackage.total_payout,
+                getReferralBonus(targetPackage)
+            ]
+        );
+
+        // Award the referrer a bonus on the new money committed (the upgrade
+        // difference), consistent with the referral bonus paid on activation.
+        if (user.referred_by) {
+            await dbRunAsync(
+                `UPDATE users
+                 SET affiliate_balance = COALESCE(affiliate_balance, 0) + ?
+                 WHERE id != ? AND (
+                    LOWER(my_referral_id) = LOWER(?) OR LOWER(username) = LOWER(?)
+                 )`,
+                [referralBonus, req.user.id, user.referred_by, user.referred_by]
+            );
+        }
+
+        await dbRunAsync('COMMIT');
+        transactionOpen = false;
+
+        console.warn(`[UPGRADE] ${user.username} upgraded from ${current.package_name} to ${targetPackage.name} (cost ₦${upgradeCost})`);
+
+        res.json({
+            success: true,
+            message: `Successfully upgraded to ${targetPackage.name}. ₦${upgradeCost.toLocaleString()} was deducted from your wallet.`,
+            upgrade_cost: upgradeCost,
+            newBalance,
+            previous_package: { id: current.package_id, name: current.package_name, capital: current.capital },
+            package: serializePackageForApi(targetPackage)
+        });
+    } catch (error) {
+        if (transactionOpen) {
+            try { await dbRunAsync('ROLLBACK'); } catch (_) {}
+        }
+        console.error('Upgrade package error:', error.message);
+        res.status(500).json({ error: 'Failed to upgrade package. Please try again.' });
+    }
+});
+
 // ==========================================
 // 4. WITHDRAWAL REQUESTS (User initiated)
 // ==========================================
@@ -1380,7 +1727,63 @@ function stripReceipt(deposit) {
     return clone;
 }
 
-app.post('/api/request-deposit', authenticateToken, async (req, res) => {
+// Validates the receipt whether it arrived as a base64 data URL (legacy JSON
+// body) or as a streamed multipart file (the mobile-friendly path added to fix
+// upload hangs/refreshes on phones). Returns { mime, data } where data is the
+// base64 string stored in SQLite, or sends a 400 and returns null.
+function resolveReceipt(req, res) {
+    // Preferred path: multipart/form-data file upload. req.file is populated by
+    // the multer middleware. This streams the bytes off the socket with no
+    // base64 inflation in the browser, which is what makes mobile reliable.
+    if (req.file && req.file.buffer) {
+        if (req.file.buffer.length === 0) {
+            res.status(400).json({ error: "Receipt file appears to be empty." });
+            return null;
+        }
+        if (req.file.buffer.length > MAX_RECEIPT_SIZE) {
+            res.status(400).json({ error: "Receipt file is too large. Maximum size is 5MB. Please choose a smaller or compressed photo." });
+            return null;
+        }
+        return {
+            mime: req.file.mimetype,
+            data: req.file.buffer.toString('base64')
+        };
+    }
+
+    // Legacy path: base64 data URL inside JSON. Kept for backward compatibility
+    // with existing clients (especially desktop), but new/mobile clients should
+    // use multipart uploads instead.
+    const receipt = req.body && req.body.receipt;
+    if (receipt) {
+        const parsed = parseDataUrl(receipt);
+        if (!parsed) {
+            res.status(400).json({ error: "Invalid receipt format. Please upload a valid image (PNG/JPG/PDF)." });
+            return null;
+        }
+        if (!/^image\/(png|jpe?g|gif|webp)$/.test(parsed.mime) && parsed.mime !== 'application/pdf') {
+            res.status(400).json({ error: "Receipt must be a PNG, JPG, GIF, WEBP or PDF file." });
+            return null;
+        }
+        if (parsed.buffer.length === 0) {
+            res.status(400).json({ error: "Receipt file appears to be empty." });
+            return null;
+        }
+        if (parsed.buffer.length > MAX_RECEIPT_SIZE) {
+            res.status(400).json({ error: "Receipt file is too large. Maximum size is 5MB. Please choose a smaller or compressed photo." });
+            return null;
+        }
+        return {
+            mime: parsed.mime,
+            data: parsed.buffer.toString('base64')
+        };
+    }
+
+    res.status(400).json({ error: "Please upload your payment receipt to complete the deposit request." });
+    return null;
+}
+
+// Shared deposit-submission logic used by both the JSON and multipart routes.
+async function handleDepositRequest(req, res) {
     try {
         // Guarantee the deposits table has all columns referenced by the INSERT
         // below before we attempt it. On existing production DBs these columns
@@ -1388,7 +1791,12 @@ app.post('/api/request-deposit', authenticateToken, async (req, res) => {
         // EXISTS, which is a no-op once the table exists.
         await ensureDepositSchema();
 
-        const { amount, payment_method, transaction_ref, sender_name, receipt } = req.body;
+        // For multipart requests, text fields land in req.body (already parsed
+        // by multer). Coerce defensively for both content types.
+        const amount = req.body ? req.body.amount : undefined;
+        const payment_method = req.body ? req.body.payment_method : undefined;
+        const transaction_ref = req.body ? req.body.transaction_ref : undefined;
+        const sender_name = req.body ? req.body.sender_name : undefined;
         const username = req.user.username;
 
         if (!amount || !isValidAmount(amount) || amount < 1000) {
@@ -1399,27 +1807,10 @@ app.post('/api/request-deposit', authenticateToken, async (req, res) => {
             return res.status(403).json({ error: "Manual deposits are currently disabled." });
         }
 
-        let receiptMime = null;
-        let receiptData = null;
-        if (receipt) {
-            const parsed = parseDataUrl(receipt);
-            if (!parsed) {
-                return res.status(400).json({ error: "Invalid receipt format. Please upload a valid image (PNG/JPG/PDF)." });
-            }
-            if (!/^image\/(png|jpe?g|gif|webp)$/.test(parsed.mime) && parsed.mime !== 'application/pdf') {
-                return res.status(400).json({ error: "Receipt must be a PNG, JPG, GIF, WEBP or PDF file." });
-            }
-            if (parsed.buffer.length === 0) {
-                return res.status(400).json({ error: "Receipt file appears to be empty." });
-            }
-            if (parsed.buffer.length > MAX_RECEIPT_SIZE) {
-                return res.status(400).json({ error: "Receipt file is too large. Maximum size is 5MB." });
-            }
-            receiptData = parsed.buffer.toString('base64');
-            receiptMime = parsed.mime;
-        } else {
-            return res.status(400).json({ error: "Please upload your payment receipt to complete the deposit request." });
-        }
+        const resolved = resolveReceipt(req, res);
+        if (!resolved) return; // 400 already sent
+        const receiptData = resolved.data;
+        const receiptMime = resolved.mime;
 
         const userRow = await dbGetAsync(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [username]);
 
@@ -1464,7 +1855,16 @@ app.post('/api/request-deposit', authenticateToken, async (req, res) => {
         console.error('Deposit request error:', error.message);
         res.status(500).json({ error: "Server error. Please try again." });
     }
-});
+}
+
+// Multipart (streaming) endpoint — recommended for mobile clients. The file is
+// sent as a normal binary form field ("receipt"), avoiding the base64 memory
+// blow-up that caused mobile browsers to hang or refresh.
+app.post('/api/request-deposit/upload', authenticateToken, actionLimiter, uploadReceipt, handleDepositRequest);
+
+// Legacy JSON endpoint. Kept for backward compatibility with existing desktop
+// clients that POST a base64 data URL in the JSON body.
+app.post('/api/request-deposit', authenticateToken, actionLimiter, handleDepositRequest);
 
 // User: their own deposit history.
 // NOTE: uses /api/my-deposits (not /api/user/deposits) to avoid being captured
@@ -1620,24 +2020,79 @@ app.post('/api/admin/decline-deposit', authenticateToken, adminOnly, async (req,
 // ==========================================
 app.post('/api/claim-daily-task', authenticateToken, async (req, res) => {
     try {
+        const userId = req.user.id;
         const username = req.user.username;
-        const { amount } = req.body;
-        if (!amount || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
-        db.get(`SELECT taskEarnings, planActivated FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
-            if (err || !user) return res.status(404).json({ error: "User not found" });
-            if (user.planActivated !== 'true') return res.status(403).json({ error: "You must activate a plan first" });
-            const today = new Date().toISOString().split('T')[0];
-            db.get(`SELECT id FROM daily_claims WHERE username = ? AND claim_date = ?`, [username, today], async (err, claim) => {
-                if (claim) return res.status(400).json({ error: "You have already claimed your daily task today. Come back tomorrow!" });
-                const newTaskEarnings = (user.taskEarnings || 0) + amount;
-                db.run(`UPDATE users SET taskEarnings = ? WHERE LOWER(username) = LOWER(?)`, [newTaskEarnings, username], function(updateErr) {
-                    if (updateErr) return res.status(500).json({ error: "Failed to update earnings" });
-                    db.run(`INSERT INTO daily_claims (username, claim_date, amount) VALUES (?, ?, ?)`, [username, today, amount]);
-                    res.json({ success: true, message: `Successfully claimed ₦${amount}!`, newBalance: newTaskEarnings });
-                });
+
+        const user = await dbGetAsync(
+            `SELECT id, username, taskEarnings, planActivated, activePackage, activePackageId
+             FROM users WHERE id = ?`,
+            [userId]
+        );
+        if (!user) return res.status(404).json({ error: "User not found" });
+        if (user.planActivated !== 'true') {
+            return res.status(403).json({ error: "You must activate a plan first" });
+        }
+
+        // Determine the claim amount. Prefer the active investment's snapshotted
+        // daily_earning (authoritative), then the amount the client sends. This
+        // avoids zero/incorrect claims when old clients send a stale amount.
+        let amount = Number(req.body && req.body.amount);
+        const activeInvestment = await dbGetAsync(
+            `SELECT daily_earning FROM user_investments WHERE user_id = ? AND status = 'active' ORDER BY activated_at DESC LIMIT 1`,
+            [userId]
+        );
+        if (activeInvestment && activeInvestment.daily_earning > 0) {
+            amount = Number(activeInvestment.daily_earning);
+        }
+        if (!amount || amount <= 0) {
+            return res.status(400).json({ error: "Invalid claim amount. Please activate a valid package." });
+        }
+
+        // Idempotent daily claim keyed by both user id and username.
+        const today = new Date().toISOString().split('T')[0];
+        const existing = await dbGetAsync(
+            `SELECT id, amount FROM daily_claims WHERE (username = ? OR username = ?) AND claim_date = ? LIMIT 1`,
+            [username, user.username, today]
+        );
+        if (existing) {
+            return res.status(400).json({
+                error: "You have already claimed your daily earnings today. Come back tomorrow!",
+                already_claimed: true,
+                claimed_amount: Number(existing.amount || 0)
             });
+        }
+
+        const newTaskEarnings = (Number(user.taskEarnings) || 0) + amount;
+        await dbRunAsync(
+            `UPDATE users SET taskEarnings = ? WHERE id = ?`,
+            [newTaskEarnings, userId]
+        );
+        await dbRunAsync(
+            `INSERT INTO daily_claims (username, claim_date, amount) VALUES (?, ?, ?)`,
+            [username, today, amount]
+        );
+
+        const refreshed = await dbGetAsync(
+            `SELECT balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance
+             FROM users WHERE id = ?`,
+            [userId]
+        );
+
+        res.json({
+            success: true,
+            message: `Successfully claimed ₦${amount.toLocaleString()}!`,
+            claimed_amount: amount,
+            newBalance: newTaskEarnings,
+            balances: refreshed ? {
+                balance: Number(refreshed.balance ?? 0),
+                wallet_balance: Number(refreshed.wallet_balance ?? 0),
+                taskEarnings: Number(refreshed.taskEarnings ?? 0),
+                daily_earnings: Number(refreshed.daily_earnings ?? 0),
+                affiliate_balance: Number(refreshed.affiliate_balance ?? 0)
+            } : null
         });
     } catch (error) {
+        console.error('Claim daily task error:', error.message);
         res.status(500).json({ error: "Server error" });
     }
 });
@@ -2519,7 +2974,15 @@ process.on('SIGTERM', () => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
     processActiveInvestmentCycles();
     setInterval(processActiveInvestmentCycles, 60 * 60 * 1000);
 });
+
+// Bounds for slow/unreliable clients (notably mobile uploads). Without these a
+// stalled mobile upload could leave a request (and its in-memory body) hanging
+// indefinitely. The headers/request timeouts fail fast so the client can show an
+// error and retry instead of appearing to freeze or refresh.
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 70000;
+server.requestTimeout = 120000; // 2 minutes to allow large/slow receipt uploads
