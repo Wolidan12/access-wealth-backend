@@ -1284,6 +1284,168 @@ app.post('/api/activate', authenticateToken, actionLimiter, (req, res) => {
     });
 });
 
+// GET the authenticated user's currently active investment cycle (or null).
+// Used by the dashboard/upgrade screen to show the active package and to let
+// the frontend calculate the cost of upgrading to a higher package.
+app.get('/api/active-investment', authenticateToken, async (req, res) => {
+    try {
+        const investment = await dbGetAsync(
+            `SELECT id, package_id, package_name, capital, daily_rate, cycle_days,
+                    daily_earning, total_payout, referral_bonus, days_credited,
+                    status, activated_at, completed_at
+             FROM user_investments
+             WHERE user_id = ? AND status = 'active'
+             ORDER BY activated_at DESC
+             LIMIT 1`,
+            [req.user.id]
+        );
+
+        const user = await dbGetAsync(
+            `SELECT balance, wallet_balance, planActivated, activePackage, activePackageId
+             FROM users WHERE id = ?`,
+            [req.user.id]
+        );
+
+        res.json({
+            success: true,
+            hasActive: !!investment,
+            investment: investment || null,
+            balance: user ? (user.wallet_balance ?? user.balance ?? 0) : 0
+        });
+    } catch (error) {
+        console.error('Active investment lookup error:', error.message);
+        res.status(500).json({ error: 'Failed to load active investment.' });
+    }
+});
+
+// POST upgrade the authenticated user's ACTIVE package to a HIGHER package.
+// The user has already locked the current package's capital, so they only pay
+// the difference (newCapital - currentCapital) from their wallet balance. The
+// current cycle is ended with status 'upgraded' and a fresh cycle for the new
+// package begins immediately. Daily earnings already credited are kept.
+app.post('/api/upgrade-package', authenticateToken, actionLimiter, async (req, res) => {
+    const packageId = (req.body.package_id || req.body.packageId || '').toString().trim().toLowerCase();
+    const fallbackName = (req.body.name || '').toString().trim().toLowerCase();
+    const targetPackage = PACKAGE_BY_ID[packageId] || PACKAGE_BY_NAME[fallbackName];
+
+    if (!targetPackage) {
+        return res.status(400).json({ error: 'Invalid package selection.' });
+    }
+
+    let transactionOpen = false;
+    try {
+        const user = await dbGetAsync(
+            `SELECT id, username, balance, wallet_balance, referred_by FROM users WHERE id = ?`,
+            [req.user.id]
+        );
+        if (!user) return res.status(404).json({ error: 'User not found.' });
+
+        const current = await dbGetAsync(
+            `SELECT id, package_id, package_name, capital FROM user_investments
+             WHERE user_id = ? AND status = 'active'
+             ORDER BY activated_at DESC LIMIT 1`,
+            [req.user.id]
+        );
+
+        if (!current) {
+            return res.status(400).json({
+                error: 'You do not have an active package to upgrade. Please activate a package first.'
+            });
+        }
+
+        if (targetPackage.capital <= current.capital) {
+            return res.status(400).json({
+                error: 'You can only upgrade to a higher package. Please select a package with a larger capital.'
+            });
+        }
+
+        const upgradeCost = targetPackage.capital - current.capital;
+        const currentBalance = Number(user.wallet_balance ?? user.balance ?? 0);
+        if (currentBalance < upgradeCost) {
+            return res.status(400).json({
+                error: `Insufficient balance to upgrade. You need ₦${upgradeCost.toLocaleString()} more.`
+            });
+        }
+
+        const referralBonus = Math.round(upgradeCost * 0.5);
+        const newBalance = currentBalance - upgradeCost;
+
+        await dbRunAsync('BEGIN IMMEDIATE TRANSACTION');
+        transactionOpen = true;
+
+        // End the current cycle.
+        await dbRunAsync(
+            `UPDATE user_investments
+             SET status = 'upgraded', completed_at = datetime('now')
+             WHERE id = ? AND status = 'active'`,
+            [current.id]
+        );
+
+        // Deduct only the difference.
+        await dbRunAsync(
+            `UPDATE users
+             SET balance = COALESCE(balance, 0) - ?,
+                 wallet_balance = COALESCE(wallet_balance, 0) - ?,
+                 activePackage = ?, activePackageId = ?, planActivated = 'true'
+             WHERE id = ?`,
+            [upgradeCost, upgradeCost, targetPackage.name, targetPackage.id, req.user.id]
+        );
+
+        // Start the new (upgraded) cycle fresh.
+        await dbRunAsync(
+            `INSERT INTO user_investments
+             (user_id, username, package_id, package_name, capital, daily_rate, cycle_days,
+              daily_earning, total_payout, referral_bonus, days_credited, status, activated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', datetime('now'))`,
+            [
+                req.user.id,
+                user.username,
+                targetPackage.id,
+                targetPackage.name,
+                targetPackage.capital,
+                targetPackage.daily_rate,
+                targetPackage.cycle_days,
+                targetPackage.daily_earning,
+                targetPackage.total_payout,
+                getReferralBonus(targetPackage)
+            ]
+        );
+
+        // Award the referrer a bonus on the new money committed (the upgrade
+        // difference), consistent with the referral bonus paid on activation.
+        if (user.referred_by) {
+            await dbRunAsync(
+                `UPDATE users
+                 SET affiliate_balance = COALESCE(affiliate_balance, 0) + ?
+                 WHERE id != ? AND (
+                    LOWER(my_referral_id) = LOWER(?) OR LOWER(username) = LOWER(?)
+                 )`,
+                [referralBonus, req.user.id, user.referred_by, user.referred_by]
+            );
+        }
+
+        await dbRunAsync('COMMIT');
+        transactionOpen = false;
+
+        console.warn(`[UPGRADE] ${user.username} upgraded from ${current.package_name} to ${targetPackage.name} (cost ₦${upgradeCost})`);
+
+        res.json({
+            success: true,
+            message: `Successfully upgraded to ${targetPackage.name}. ₦${upgradeCost.toLocaleString()} was deducted from your wallet.`,
+            upgrade_cost: upgradeCost,
+            newBalance,
+            previous_package: { id: current.package_id, name: current.package_name, capital: current.capital },
+            package: serializePackageForApi(targetPackage)
+        });
+    } catch (error) {
+        if (transactionOpen) {
+            try { await dbRunAsync('ROLLBACK'); } catch (_) {}
+        }
+        console.error('Upgrade package error:', error.message);
+        res.status(500).json({ error: 'Failed to upgrade package. Please try again.' });
+    }
+});
+
 // ==========================================
 // 4. WITHDRAWAL REQUESTS (User initiated)
 // ==========================================
