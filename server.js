@@ -9,6 +9,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
+const multer = require('multer');
 
 const app = express();
 const jwtSecret = process.env.JWT_SECRET;
@@ -77,6 +78,66 @@ function parseDataUrl(dataUrl) {
 }
 
 const MAX_RECEIPT_SIZE = 5 * 1024 * 1024; // 5MB
+
+// Allowed receipt MIME types. Images (PNG/JPG/GIF/WEBP) and PDF.
+const ALLOWED_RECEIPT_MIMES = new Set([
+    'image/png',
+    'image/jpeg',
+    'image/jpg',
+    'image/gif',
+    'image/webp',
+    'application/pdf'
+]);
+
+// Multipart upload handler. Files are kept in memory (Buffer) so the deposit
+// handler can base64-encode them for storage exactly like the legacy JSON path,
+// but they are streamed off the socket instead of being inflated into a giant
+// base64 JSON string. This is what makes mobile uploads reliable: on mobile,
+// high-resolution camera photos are commonly 4-10MB, and base64 + JSON parsing
+// of that string pushes the browser tab over its memory limit, causing it to
+// hang or be killed (which appears to the user as a refresh).
+const receiptUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+        fileSize: MAX_RECEIPT_SIZE,
+        // Guard against abusive multi-field payloads.
+        files: 1,
+        fields: 20,
+        fieldSize: 1 * 1024 * 1024
+    },
+    fileFilter: (req, file, cb) => {
+        if (ALLOWED_RECEIPT_MIMES.has(file.mimetype)) {
+            return cb(null, true);
+        }
+        const err = new Error('Receipt must be a PNG, JPG, GIF, WEBP or PDF file.');
+        err.code = 'UNSUPPORTED_RECEIPT_TYPE';
+        cb(err);
+    }
+});
+
+// Middleware that runs a single-file multer upload and translates multer errors
+// into clean 400 JSON responses (instead of the default HTML error page or a
+// 500). In particular LIMIT_FILE_SIZE returns a message the mobile client can
+// show directly so the user knows to compress/choose a smaller photo.
+function uploadReceipt(req, res, next) {
+    receiptUpload.single('receipt')(req, res, (err) => {
+        if (err) {
+            if (err.code === 'LIMIT_FILE_SIZE') {
+                return res.status(400).json({
+                    error: 'Receipt file is too large. Maximum size is 5MB. Please choose a smaller or compressed photo.'
+                });
+            }
+            if (err.code === 'UNSUPPORTED_RECEIPT_TYPE') {
+                return res.status(400).json({ error: err.message });
+            }
+            if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+                return res.status(400).json({ error: 'Unexpected file field. Upload the receipt using the "receipt" field.' });
+            }
+            return res.status(400).json({ error: 'Failed to upload receipt. Please try again.' });
+        }
+        next();
+    });
+}
 
 app.use(express.static(__dirname));
 
@@ -1380,7 +1441,63 @@ function stripReceipt(deposit) {
     return clone;
 }
 
-app.post('/api/request-deposit', authenticateToken, async (req, res) => {
+// Validates the receipt whether it arrived as a base64 data URL (legacy JSON
+// body) or as a streamed multipart file (the mobile-friendly path added to fix
+// upload hangs/refreshes on phones). Returns { mime, data } where data is the
+// base64 string stored in SQLite, or sends a 400 and returns null.
+function resolveReceipt(req, res) {
+    // Preferred path: multipart/form-data file upload. req.file is populated by
+    // the multer middleware. This streams the bytes off the socket with no
+    // base64 inflation in the browser, which is what makes mobile reliable.
+    if (req.file && req.file.buffer) {
+        if (req.file.buffer.length === 0) {
+            res.status(400).json({ error: "Receipt file appears to be empty." });
+            return null;
+        }
+        if (req.file.buffer.length > MAX_RECEIPT_SIZE) {
+            res.status(400).json({ error: "Receipt file is too large. Maximum size is 5MB. Please choose a smaller or compressed photo." });
+            return null;
+        }
+        return {
+            mime: req.file.mimetype,
+            data: req.file.buffer.toString('base64')
+        };
+    }
+
+    // Legacy path: base64 data URL inside JSON. Kept for backward compatibility
+    // with existing clients (especially desktop), but new/mobile clients should
+    // use multipart uploads instead.
+    const receipt = req.body && req.body.receipt;
+    if (receipt) {
+        const parsed = parseDataUrl(receipt);
+        if (!parsed) {
+            res.status(400).json({ error: "Invalid receipt format. Please upload a valid image (PNG/JPG/PDF)." });
+            return null;
+        }
+        if (!/^image\/(png|jpe?g|gif|webp)$/.test(parsed.mime) && parsed.mime !== 'application/pdf') {
+            res.status(400).json({ error: "Receipt must be a PNG, JPG, GIF, WEBP or PDF file." });
+            return null;
+        }
+        if (parsed.buffer.length === 0) {
+            res.status(400).json({ error: "Receipt file appears to be empty." });
+            return null;
+        }
+        if (parsed.buffer.length > MAX_RECEIPT_SIZE) {
+            res.status(400).json({ error: "Receipt file is too large. Maximum size is 5MB. Please choose a smaller or compressed photo." });
+            return null;
+        }
+        return {
+            mime: parsed.mime,
+            data: parsed.buffer.toString('base64')
+        };
+    }
+
+    res.status(400).json({ error: "Please upload your payment receipt to complete the deposit request." });
+    return null;
+}
+
+// Shared deposit-submission logic used by both the JSON and multipart routes.
+async function handleDepositRequest(req, res) {
     try {
         // Guarantee the deposits table has all columns referenced by the INSERT
         // below before we attempt it. On existing production DBs these columns
@@ -1388,7 +1505,12 @@ app.post('/api/request-deposit', authenticateToken, async (req, res) => {
         // EXISTS, which is a no-op once the table exists.
         await ensureDepositSchema();
 
-        const { amount, payment_method, transaction_ref, sender_name, receipt } = req.body;
+        // For multipart requests, text fields land in req.body (already parsed
+        // by multer). Coerce defensively for both content types.
+        const amount = req.body ? req.body.amount : undefined;
+        const payment_method = req.body ? req.body.payment_method : undefined;
+        const transaction_ref = req.body ? req.body.transaction_ref : undefined;
+        const sender_name = req.body ? req.body.sender_name : undefined;
         const username = req.user.username;
 
         if (!amount || !isValidAmount(amount) || amount < 1000) {
@@ -1399,27 +1521,10 @@ app.post('/api/request-deposit', authenticateToken, async (req, res) => {
             return res.status(403).json({ error: "Manual deposits are currently disabled." });
         }
 
-        let receiptMime = null;
-        let receiptData = null;
-        if (receipt) {
-            const parsed = parseDataUrl(receipt);
-            if (!parsed) {
-                return res.status(400).json({ error: "Invalid receipt format. Please upload a valid image (PNG/JPG/PDF)." });
-            }
-            if (!/^image\/(png|jpe?g|gif|webp)$/.test(parsed.mime) && parsed.mime !== 'application/pdf') {
-                return res.status(400).json({ error: "Receipt must be a PNG, JPG, GIF, WEBP or PDF file." });
-            }
-            if (parsed.buffer.length === 0) {
-                return res.status(400).json({ error: "Receipt file appears to be empty." });
-            }
-            if (parsed.buffer.length > MAX_RECEIPT_SIZE) {
-                return res.status(400).json({ error: "Receipt file is too large. Maximum size is 5MB." });
-            }
-            receiptData = parsed.buffer.toString('base64');
-            receiptMime = parsed.mime;
-        } else {
-            return res.status(400).json({ error: "Please upload your payment receipt to complete the deposit request." });
-        }
+        const resolved = resolveReceipt(req, res);
+        if (!resolved) return; // 400 already sent
+        const receiptData = resolved.data;
+        const receiptMime = resolved.mime;
 
         const userRow = await dbGetAsync(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [username]);
 
@@ -1464,7 +1569,16 @@ app.post('/api/request-deposit', authenticateToken, async (req, res) => {
         console.error('Deposit request error:', error.message);
         res.status(500).json({ error: "Server error. Please try again." });
     }
-});
+}
+
+// Multipart (streaming) endpoint — recommended for mobile clients. The file is
+// sent as a normal binary form field ("receipt"), avoiding the base64 memory
+// blow-up that caused mobile browsers to hang or refresh.
+app.post('/api/request-deposit/upload', authenticateToken, actionLimiter, uploadReceipt, handleDepositRequest);
+
+// Legacy JSON endpoint. Kept for backward compatibility with existing desktop
+// clients that POST a base64 data URL in the JSON body.
+app.post('/api/request-deposit', authenticateToken, actionLimiter, handleDepositRequest);
 
 // User: their own deposit history.
 // NOTE: uses /api/my-deposits (not /api/user/deposits) to avoid being captured
@@ -2519,7 +2633,15 @@ process.on('SIGTERM', () => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
     processActiveInvestmentCycles();
     setInterval(processActiveInvestmentCycles, 60 * 60 * 1000);
 });
+
+// Bounds for slow/unreliable clients (notably mobile uploads). Without these a
+// stalled mobile upload could leave a request (and its in-memory body) hanging
+// indefinitely. The headers/request timeouts fail fast so the client can show an
+// error and retry instead of appearing to freeze or refresh.
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 70000;
+server.requestTimeout = 120000; // 2 minutes to allow large/slow receipt uploads
