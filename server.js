@@ -9,7 +9,18 @@ const axios = require('axios');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
-const multer = require('multer');
+
+// Receipt uploads are an optional enhancement. Keep the API available when a
+// deployment omits the optional multer package: a missing upload dependency
+// must not prevent the process from starting (which would make every endpoint,
+// including /api/login, look like a network error to the frontend).
+let multer = null;
+try {
+    // eslint-disable-next-line global-require
+    multer = require('multer');
+} catch (error) {
+    console.warn('WARN: multer is unavailable. Multipart receipt uploads are disabled; JSON receipt uploads remain available.', error.message);
+}
 
 const app = express();
 const jwtSecret = process.env.JWT_SECRET;
@@ -154,7 +165,7 @@ const ALLOWED_RECEIPT_MIMES = new Set([
 // high-resolution camera photos are commonly 4-10MB, and base64 + JSON parsing
 // of that string pushes the browser tab over its memory limit, causing it to
 // hang or be killed (which appears to the user as a refresh).
-const receiptUpload = multer({
+const receiptUpload = multer ? multer({
     storage: multer.memoryStorage(),
     limits: {
         fileSize: MAX_RECEIPT_SIZE,
@@ -171,13 +182,19 @@ const receiptUpload = multer({
         err.code = 'UNSUPPORTED_RECEIPT_TYPE';
         cb(err);
     }
-});
+}) : null;
 
 // Middleware that runs a single-file multer upload and translates multer errors
 // into clean 400 JSON responses (instead of the default HTML error page or a
 // 500). In particular LIMIT_FILE_SIZE returns a message the mobile client can
 // show directly so the user knows to compress/choose a smaller photo.
 function uploadReceipt(req, res, next) {
+    if (!receiptUpload) {
+        return res.status(503).json({
+            error: 'Multipart receipt uploads are temporarily unavailable. Please use the JSON receipt upload or try again later.'
+        });
+    }
+
     receiptUpload.single('receipt')(req, res, (err) => {
         if (err) {
             if (err.code === 'LIMIT_FILE_SIZE') {
@@ -325,6 +342,21 @@ function dbAllAsync(sql, params = []) {
             resolve(rows || []);
         });
     });
+}
+
+// Read a feature/site setting with a safe fallback. Settings are stored as
+// strings in SQLite, and callers use the callback form so they can return a
+// clean API error if the database is unavailable. Keeping this helper central
+// also avoids each feature implementing a subtly different defaulting rule.
+function readSiteSetting(key, fallbackValue, callback) {
+    db.get(
+        `SELECT value FROM site_settings WHERE key = ?`,
+        [key],
+        (err, row) => {
+            if (err) return callback(err, fallbackValue);
+            callback(null, row && row.value !== undefined ? String(row.value) : fallbackValue);
+        }
+    );
 }
 
 // Returns true when a table column already exists. Used to make schema
