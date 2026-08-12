@@ -23,7 +23,19 @@ try {
 }
 
 const app = express();
-const jwtSecret = process.env.JWT_SECRET;
+const isProduction = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
+const configuredJwtSecret = (process.env.JWT_SECRET || '').trim();
+
+// A missing JWT secret used to throw while this module was loading. That stops
+// Express from listening at all, so the browser can only report a vague
+// "Network error" when it tries to log in. Keep production deployments
+// explicit and safe: they return a clear 503 until JWT_SECRET is configured.
+// For local development, an ephemeral secret keeps the API usable without
+// making a developer copy a secret into the repository. Development tokens are
+// intentionally invalidated whenever the process restarts.
+const jwtSecret = configuredJwtSecret || (!isProduction
+    ? crypto.randomBytes(32).toString('hex')
+    : null);
 
 // How long an access token lives. Raised from 7 days to 30 days so users who
 // don't open the app every week (e.g. returning to claim daily earnings) are not
@@ -34,11 +46,23 @@ const JWT_ISSUER = 'AccessWealthHQ';
 const JWT_AUDIENCE = 'AccessWealthUsers';
 
 function signAccessToken(user) {
+    if (!jwtSecret) {
+        throw new Error('JWT_SECRET is not configured');
+    }
     return jwt.sign(
         { id: user.id, username: user.username, role: user.role || 'user' },
         jwtSecret,
         { expiresIn: ACCESS_TOKEN_TTL, issuer: JWT_ISSUER, audience: JWT_AUDIENCE }
     );
+}
+
+function requireJwtSecret(res) {
+    if (jwtSecret) return true;
+    res.status(503).json({
+        error: 'Authentication is temporarily unavailable. Please try again later.',
+        code: 'AUTH_NOT_CONFIGURED'
+    });
+    return false;
 }
 
 // Builds the full, normalized user object returned by login/register/refresh and
@@ -84,7 +108,7 @@ function serializeUser(user) {
 }
 
 if (!jwtSecret) {
-    throw new Error('JWT_SECRET must be configured before the server can start.');
+    console.error('ERROR: JWT_SECRET is not configured. Authentication endpoints will return 503 until it is set.');
 }
 
 if (!process.env.SQUAD_SECRET_KEY) {
@@ -94,16 +118,81 @@ if (!process.env.SQUAD_SECRET_KEY) {
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
 
-const allowedOrigins = (process.env.FRONTEND_URL || 'https://accesswealthhq.com,http://localhost:3000,http://127.0.0.1:3000,http://127.0.0.1:5500,http://localhost:5500,http://127.0.0.1:5173,http://localhost:5173').split(',');
+const DEFAULT_FRONTEND_ORIGINS = [
+    'https://accesswealthhq.com',
+    'https://www.accesswealthhq.com',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://localhost:5500',
+    'http://127.0.0.1:5500',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173'
+];
+
+// FRONTEND_URL is commonly entered as a comma-separated list, sometimes with
+// spaces, a trailing slash, or a path. Comparing that raw value with the
+// browser's Origin header makes an otherwise healthy login request fail CORS
+// and appear to the user as a network failure. Store normalized origins only.
+function normalizeOrigin(value) {
+    const rawValue = String(value || '').trim();
+    if (!rawValue) return null;
+    // A wildcard cannot be used with credentials: true and would otherwise
+    // silently block every browser origin, so ignore it and use the safe
+    // defaults/configured origins instead.
+    if (rawValue === '*') return null;
+
+    try {
+        const parsed = new URL(rawValue);
+        if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+        return parsed.origin;
+    } catch (_) {
+        return null;
+    }
+}
+
+function getOriginAliases(origin) {
+    const aliases = [origin];
+    try {
+        const parsed = new URL(origin);
+        if (parsed.hostname === 'accesswealthhq.com') {
+            aliases.push(`${parsed.protocol}//www.accesswealthhq.com${parsed.port ? `:${parsed.port}` : ''}`);
+        } else if (parsed.hostname === 'www.accesswealthhq.com') {
+            aliases.push(`${parsed.protocol}//accesswealthhq.com${parsed.port ? `:${parsed.port}` : ''}`);
+        }
+    } catch (_) {
+        // normalizeOrigin already filtered invalid values.
+    }
+    return aliases;
+}
+
+const configuredFrontendOrigins = (process.env.FRONTEND_URL || '')
+    .split(',')
+    .map(normalizeOrigin)
+    .filter(Boolean);
+const allowedOrigins = new Set(
+    (configuredFrontendOrigins.length ? configuredFrontendOrigins : DEFAULT_FRONTEND_ORIGINS)
+        .flatMap(getOriginAliases)
+);
+const allowAnyDevelopmentOrigin = !isProduction &&
+    String(process.env.NODE_ENV || '').toLowerCase() === 'development';
+
 app.use(cors({
     origin: function (origin, callback) {
+        // Requests without an Origin header include same-origin requests, curl,
+        // health checks, and server-to-server calls. They do not need CORS.
         if (!origin) return callback(null, true);
-        if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV === 'development') {
-            callback(null, true);
-        } else {
-            console.warn(`Blocked CORS request from ${origin}`);
-            callback(new Error('Not allowed by CORS'));
+
+        const normalizedOrigin = normalizeOrigin(origin);
+        if (allowAnyDevelopmentOrigin || allowedOrigins.has(normalizedOrigin)) {
+            return callback(null, true);
         }
+
+        // Do not throw here. Throwing makes the global error handler return a
+        // response without CORS headers, which hides the useful status behind a
+        // browser-level "Network error". The request is still denied, but the
+        // server logs the exact origin that needs to be added to FRONTEND_URL.
+        console.warn(`Blocked CORS request from ${origin}. Add this origin to FRONTEND_URL if it is the deployed frontend.`);
+        return callback(null, false);
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-squad-encrypted-body', 'x-squad-signature'],
@@ -116,6 +205,9 @@ app.use(express.json({
         req.rawBody = buf;
     }
 }));
+// Accept traditional form posts as well as JSON. This keeps the auth endpoint
+// compatible with simple HTML/mobile clients without changing the JSON API.
+app.use(express.urlencoded({ extended: false, limit: '100kb' }));
 
 // ==========================================
 // MANUAL PAYMENT CONFIGURATION
@@ -882,7 +974,25 @@ db.serialize(() => {
     }, 500);
 });
 
+// Lightweight deployment probe. A frontend can distinguish "the API is down"
+// from a bad username/password, and Railway/other hosts can use this endpoint
+// as a health check without needing an auth token.
+app.get(['/health', '/api/health'], (req, res) => {
+    db.get('SELECT 1 AS ok', [], (err) => {
+        if (err) {
+            console.error('Health check database error:', err.message);
+            return res.status(503).json({ status: 'error', database: 'unavailable' });
+        }
+        if (!jwtSecret) {
+            return res.status(503).json({ status: 'error', database: 'ok', authentication: 'not_configured' });
+        }
+        return res.json({ status: 'ok', database: 'ok', authentication: 'ok' });
+    });
+});
+
 const authenticateToken = (req, res, next) => {
+    if (!requireJwtSecret(res)) return;
+
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.status(401).json({ error: "Access token required", code: "TOKEN_MISSING" });
@@ -952,6 +1062,8 @@ app.post('/api/user/sync', authenticateToken, (req, res) => {
 });
 
 app.post('/api/register', authLimiter, async (req, res) => {
+    if (!requireJwtSecret(res)) return;
+
     try {
         const { username, password, referred_by } = req.body;
         if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
@@ -1032,22 +1144,46 @@ app.post('/api/register', authLimiter, async (req, res) => {
 });
 
 app.post('/api/login', authLimiter, async (req, res) => {
+    if (!requireJwtSecret(res)) return;
+
     try {
-        const { username, password } = req.body;
-        if (!username || !password) return res.status(400).json({ error: "Username and password required" });
-        db.get(`SELECT * FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
-            if (err || !user) return res.status(400).json({ error: "Invalid username or password" });
-            const passwordMatch = await bcryptjs.compare(password, user.password);
-            if (!passwordMatch) return res.status(400).json({ error: "Invalid username or password" });
-            const token = signAccessToken(user);
-            res.json({
-                success: true,
-                token,
-                user: serializeUser(user)
-            });
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const username = typeof body.username === 'string' ? body.username.trim() : '';
+        // Passwords are deliberately not trimmed: spaces can be valid password
+        // characters and changing them here would make a valid login fail.
+        const password = typeof body.password === 'string' ? body.password : '';
+
+        if (!username || !password) {
+            return res.status(400).json({ error: "Username and password required" });
+        }
+
+        const user = await dbGetAsync(
+            `SELECT * FROM users WHERE LOWER(username) = LOWER(?)`,
+            [username]
+        );
+
+        if (!user || typeof user.password !== 'string') {
+            return res.status(400).json({ error: "Invalid username or password" });
+        }
+
+        const passwordMatch = await bcryptjs.compare(password, user.password);
+        if (!passwordMatch) {
+            return res.status(400).json({ error: "Invalid username or password" });
+        }
+
+        const token = signAccessToken(user);
+        return res.json({
+            success: true,
+            token,
+            user: serializeUser(user)
         });
     } catch (error) {
-        res.status(500).json({ error: 'Login failed' });
+        // Keep database/bcrypt/JWT failures inside the request lifecycle. The
+        // old callback-based implementation could reject after the outer
+        // try/catch had already returned, leaving the socket open; fetch then
+        // surfaced that as "Network error" instead of a useful API response.
+        console.error('Login error:', error);
+        return res.status(500).json({ error: 'Login failed. Please try again.' });
     }
 });
 
@@ -1125,6 +1261,8 @@ async function createSquadDepositLink(req, res) {
 // to log in again. We intentionally accept tokens up to 7 days past expiry to
 // smooth over long gaps; anything older requires a fresh login.
 app.post('/api/refresh-token', actionLimiter, (req, res) => {
+    if (!requireJwtSecret(res)) return;
+
     const authHeader = req.headers['authorization'];
     const incomingToken = authHeader && authHeader.split(' ')[1];
     if (!incomingToken) {
@@ -2990,8 +3128,16 @@ function processActiveInvestmentCycles() {
 // GLOBAL ERROR HANDLER & SHUTDOWN
 // ==========================================
 app.use((err, req, res, next) => {
-    console.error(`UNHANDLED ERROR:`, err.stack);
-    res.status(500).json({ error: "Internal server error" });
+    if (err && err.type === 'entity.parse.failed') {
+        return res.status(400).json({ error: 'Request body must contain valid JSON.' });
+    }
+    if (err && err.type === 'entity.too.large') {
+        return res.status(413).json({ error: 'Request body is too large.' });
+    }
+    if (res.headersSent) return next(err);
+
+    console.error(`UNHANDLED ERROR:`, err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: "Internal server error" });
 });
 
 process.on('unhandledRejection', (reason) => {
@@ -3007,6 +3153,12 @@ process.on('SIGTERM', () => {
 
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Access Wealth API listening on port ${PORT}`);
+    if (configuredFrontendOrigins.length) {
+        console.log(`CORS configured for ${configuredFrontendOrigins.join(', ')}`);
+    } else {
+        console.log('CORS using the default Access Wealth frontend origins. Set FRONTEND_URL for a deployed frontend origin.');
+    }
     processActiveInvestmentCycles();
     setInterval(processActiveInvestmentCycles, 60 * 60 * 1000);
 });
