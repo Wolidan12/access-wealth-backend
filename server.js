@@ -1,12 +1,14 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+
+const sqlite3 = require('./sqlite-compat');
 const jwt = require('jsonwebtoken');
 const bcryptjs = require('bcryptjs');
 const axios = require('axios');
 const crypto = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 
@@ -16,14 +18,32 @@ const helmet = require('helmet');
 // including /api/login, look like a network error to the frontend).
 let multer = null;
 try {
-    // eslint-disable-next-line global-require
     multer = require('multer');
 } catch (error) {
     console.warn('WARN: multer is unavailable. Multipart receipt uploads are disabled; JSON receipt uploads remain available.', error.message);
 }
 
 const app = express();
-const jwtSecret = process.env.JWT_SECRET;
+
+// SQLite transactions span multiple awaited statements. Keep all direct
+// database calls behind a small process-local gate so another request cannot
+// interleave a write between BEGIN and COMMIT on the same connection.
+const transactionStorage = new AsyncLocalStorage();
+let transactionTail = Promise.resolve();
+
+const isProduction = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
+const configuredJwtSecret = (process.env.JWT_SECRET || '').trim();
+
+// A missing JWT secret used to throw while this module was loading. That stops
+// Express from listening at all, so the browser can only report a vague
+// "Network error" when it tries to log in. Keep production deployments
+// explicit and safe: they return a clear 503 until JWT_SECRET is configured.
+// For local development, an ephemeral secret keeps the API usable without
+// making a developer copy a secret into the repository. Development tokens are
+// intentionally invalidated whenever the process restarts.
+const jwtSecret = configuredJwtSecret || (!isProduction
+    ? crypto.randomBytes(32).toString('hex')
+    : null);
 
 // How long an access token lives. Raised from 7 days to 30 days so users who
 // don't open the app every week (e.g. returning to claim daily earnings) are not
@@ -34,11 +54,23 @@ const JWT_ISSUER = 'AccessWealthHQ';
 const JWT_AUDIENCE = 'AccessWealthUsers';
 
 function signAccessToken(user) {
+    if (!jwtSecret) {
+        throw new Error('JWT_SECRET is not configured');
+    }
     return jwt.sign(
         { id: user.id, username: user.username, role: user.role || 'user' },
         jwtSecret,
         { expiresIn: ACCESS_TOKEN_TTL, issuer: JWT_ISSUER, audience: JWT_AUDIENCE }
     );
+}
+
+function requireJwtSecret(res) {
+    if (jwtSecret) return true;
+    res.status(503).json({
+        error: 'Authentication is temporarily unavailable. Please try again later.',
+        code: 'AUTH_NOT_CONFIGURED'
+    });
+    return false;
 }
 
 // Builds the full, normalized user object returned by login/register/refresh and
@@ -47,21 +79,24 @@ function signAccessToken(user) {
 // frontend treat fully-activated users as having an "incomplete account".
 function serializeUser(user) {
     if (!user) return null;
-    const walletBalance = Number(user.wallet_balance ?? user.balance ?? 0);
+    const walletBalance = toFiniteNumber(user.wallet_balance ?? user.balance) ?? 0;
     const profileComplete = Boolean(
-        (user.full_name && String(user.full_name).trim()) &&
-        (user.phone && String(user.phone).trim())
+        String(user.full_name || '').trim() && String(user.phone || '').trim()
     );
     // Bank details are considered complete when all three fields are present.
     const bankComplete = Boolean(
-        user.bank_name && user.bank_account_number && user.bank_account_holder
+        String(user.bank_name || '').trim() &&
+        String(user.bank_account_number || '').trim() &&
+        String(user.bank_account_holder || '').trim()
     );
+    const status = String(user.status || 'active').toLowerCase();
+    const planActivated = isTrueFlag(user.planActivated) ? 'true' : 'false';
     return {
         id: user.id,
         username: user.username,
         role: user.role || 'user',
-        status: user.status || 'active',
-        planActivated: user.planActivated ?? 'false',
+        status,
+        planActivated,
         activePackage: user.activePackage || 'None',
         activePackageId: user.activePackageId || null,
         my_referral_id: user.my_referral_id || null,
@@ -71,11 +106,11 @@ function serializeUser(user) {
         bank_name: user.bank_name || '',
         bank_account_number: user.bank_account_number || '',
         bank_account_holder: user.bank_account_holder || '',
-        balance: Number(user.balance ?? 0),
+        balance: toFiniteNumber(user.balance) ?? 0,
         wallet_balance: walletBalance,
-        taskEarnings: Number(user.taskEarnings ?? 0),
-        daily_earnings: Number(user.daily_earnings ?? 0),
-        affiliate_balance: Number(user.affiliate_balance ?? 0),
+        taskEarnings: toFiniteNumber(user.taskEarnings) ?? 0,
+        daily_earnings: toFiniteNumber(user.daily_earnings) ?? 0,
+        affiliate_balance: toFiniteNumber(user.affiliate_balance) ?? 0,
         // Convenience flags the dashboard uses to decide what to prompt for.
         profile_complete: profileComplete,
         bank_complete: bankComplete,
@@ -84,7 +119,7 @@ function serializeUser(user) {
 }
 
 if (!jwtSecret) {
-    throw new Error('JWT_SECRET must be configured before the server can start.');
+    console.error('ERROR: JWT_SECRET is not configured. Authentication endpoints will return 503 until it is set.');
 }
 
 if (!process.env.SQUAD_SECRET_KEY) {
@@ -92,18 +127,90 @@ if (!process.env.SQUAD_SECRET_KEY) {
 }
 
 app.set('trust proxy', 1);
-app.use(helmet({ contentSecurityPolicy: false }));
+// The API is intentionally consumed by a separate frontend origin. Allow
+// CORS-approved responses to be read as cross-origin resources; the default
+// Helmet CORP `same-origin` policy can otherwise make browser fetches look like
+// network failures even when the CORS headers are correct.
+app.use(helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' }
+}));
 
-const allowedOrigins = (process.env.FRONTEND_URL || 'https://accesswealthhq.com,http://localhost:3000,http://127.0.0.1:3000,http://127.0.0.1:5500,http://localhost:5500,http://127.0.0.1:5173,http://localhost:5173').split(',');
+const DEFAULT_FRONTEND_ORIGINS = [
+    'https://accesswealthhq.com',
+    'https://www.accesswealthhq.com',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://localhost:5500',
+    'http://127.0.0.1:5500',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173'
+];
+
+// FRONTEND_URL is commonly entered as a comma-separated list, sometimes with
+// spaces, a trailing slash, or a path. Comparing that raw value with the
+// browser's Origin header makes an otherwise healthy login request fail CORS
+// and appear to the user as a network failure. Store normalized origins only.
+function normalizeOrigin(value) {
+    const rawValue = String(value || '').trim();
+    if (!rawValue) return null;
+    // A wildcard cannot be used with credentials: true and would otherwise
+    // silently block every browser origin, so ignore it and use the safe
+    // defaults/configured origins instead.
+    if (rawValue === '*') return null;
+
+    try {
+        const parsed = new URL(rawValue);
+        if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+        return parsed.origin;
+    } catch (_) {
+        return null;
+    }
+}
+
+function getOriginAliases(origin) {
+    const aliases = [origin];
+    try {
+        const parsed = new URL(origin);
+        if (parsed.hostname === 'accesswealthhq.com') {
+            aliases.push(`${parsed.protocol}//www.accesswealthhq.com${parsed.port ? `:${parsed.port}` : ''}`);
+        } else if (parsed.hostname === 'www.accesswealthhq.com') {
+            aliases.push(`${parsed.protocol}//accesswealthhq.com${parsed.port ? `:${parsed.port}` : ''}`);
+        }
+    } catch (_) {
+        // normalizeOrigin already filtered invalid values.
+    }
+    return aliases;
+}
+
+const configuredFrontendOrigins = (process.env.FRONTEND_URL || '')
+    .split(',')
+    .map(normalizeOrigin)
+    .filter(Boolean);
+const allowedOrigins = new Set(
+    (configuredFrontendOrigins.length ? configuredFrontendOrigins : DEFAULT_FRONTEND_ORIGINS)
+        .flatMap(getOriginAliases)
+);
+const allowAnyDevelopmentOrigin = !isProduction &&
+    String(process.env.NODE_ENV || '').toLowerCase() === 'development';
+
 app.use(cors({
     origin: function (origin, callback) {
+        // Requests without an Origin header include same-origin requests, curl,
+        // health checks, and server-to-server calls. They do not need CORS.
         if (!origin) return callback(null, true);
-        if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV === 'development') {
-            callback(null, true);
-        } else {
-            console.warn(`Blocked CORS request from ${origin}`);
-            callback(new Error('Not allowed by CORS'));
+
+        const normalizedOrigin = normalizeOrigin(origin);
+        if (allowAnyDevelopmentOrigin || allowedOrigins.has(normalizedOrigin)) {
+            return callback(null, true);
         }
+
+        // Do not throw here. Throwing makes the global error handler return a
+        // response without CORS headers, which hides the useful status behind a
+        // browser-level "Network error". The request is still denied, but the
+        // server logs the exact origin that needs to be added to FRONTEND_URL.
+        console.warn(`Blocked CORS request from ${origin}. Add this origin to FRONTEND_URL if it is the deployed frontend.`);
+        return callback(null, false);
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-squad-encrypted-body', 'x-squad-signature'],
@@ -116,6 +223,9 @@ app.use(express.json({
         req.rawBody = buf;
     }
 }));
+// Accept traditional form posts as well as JSON. This keeps the auth endpoint
+// compatible with simple HTML/mobile clients without changing the JSON API.
+app.use(express.urlencoded({ extended: false, limit: '100kb' }));
 
 // ==========================================
 // MANUAL PAYMENT CONFIGURATION
@@ -130,7 +240,7 @@ const MANUAL_PAYMENT_INFO = {
     currency: process.env.MANUAL_CURRENCY || 'NGN',
     instructions: process.env.MANUAL_PAYMENT_INSTRUCTIONS ||
         'Transfer the deposit amount to the account below, then upload your payment receipt to complete the request. Your deposit will be credited to your wallet once an admin approves it.',
-    enabled: (process.env.MANUAL_PAYMENT_ENABLED || 'true') !== 'false'
+    enabled: !['false', '0', 'no'].includes(String(process.env.MANUAL_PAYMENT_ENABLED || 'true').trim().toLowerCase())
 };
 
 function getManualPaymentInfo() {
@@ -138,11 +248,20 @@ function getManualPaymentInfo() {
 }
 
 function parseDataUrl(dataUrl) {
-    const match = /^data:([a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(String(dataUrl || '').trim());
+    const match = /^data:([a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+);base64,([a-zA-Z0-9+/=\r\n]+)$/.exec(String(dataUrl || '').trim());
     if (!match) return null;
+
+    const encoded = match[2].replace(/[\r\n]/g, '');
+    // Buffer.from is permissive and silently ignores invalid base64 characters.
+    // Validate the canonical representation before accepting/storing a receipt.
+    if (!encoded || encoded.length % 4 === 1) return null;
+    const normalized = encoded.replace(/=+$/, '');
+    const decoded = Buffer.from(encoded, 'base64');
+    if (!decoded.length || decoded.toString('base64').replace(/=+$/, '') !== normalized) return null;
+
     return {
-        mime: match[1],
-        buffer: Buffer.from(match[2], 'base64')
+        mime: match[1].toLowerCase(),
+        buffer: decoded
     };
 }
 
@@ -214,15 +333,46 @@ function uploadReceipt(req, res, next) {
     });
 }
 
-app.use(express.static(__dirname));
+// This repository is an API-only deployment. Do not expose the repository root
+// through express.static: it contains the SQLite database, package metadata and
+// server source. A frontend, if one is added later, should be served from an
+// explicit public directory instead.
 
-function isValidAmount(val) {
-    const num = parseFloat(val);
-    return typeof num === 'number' && !isNaN(num) && isFinite(num) && num > 0;
+function toFiniteNumber(value) {
+    if (typeof value === 'number') {
+        return Number.isFinite(value) ? value : null;
+    }
+    if (typeof value !== 'string' || value.trim() === '') return null;
+    const number = Number(value.trim());
+    return Number.isFinite(number) ? number : null;
+}
+
+function isValidAmount(value) {
+    const number = toFiniteNumber(value);
+    return number !== null && number > 0;
+}
+
+function isTrueFlag(value) {
+    return value === true || value === 1 || ['true', '1'].includes(String(value ?? '').toLowerCase());
 }
 
 function isValidEmail(email) {
-    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+}
+
+const APP_TIME_ZONE = process.env.APP_TIME_ZONE || 'Africa/Lagos';
+function getClaimDate(date = new Date()) {
+    try {
+        return new Intl.DateTimeFormat('en-CA', {
+            timeZone: APP_TIME_ZONE,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit'
+        }).format(date);
+    } catch (error) {
+        console.warn(`Invalid APP_TIME_ZONE "${APP_TIME_ZONE}"; falling back to UTC.`);
+        return date.toISOString().split('T')[0];
+    }
 }
 
 function getSquadApiUrl() {
@@ -250,10 +400,13 @@ function ensureSquadConfigured(res) {
 }
 
 function isSquadWebhookSignatureValid(req) {
-    const signature = (req.headers['x-squad-encrypted-body'] || req.headers['x-squad-signature'] || '').toString();
-    const secret = process.env.SQUAD_SECRET_KEY;
+    const signature = (req.headers['x-squad-encrypted-body'] || req.headers['x-squad-signature'] || '').toString().trim();
+    const secret = (process.env.SQUAD_SECRET_KEY || '').trim();
 
-    if (!signature || !secret) return false;
+    // The signature is over the exact bytes received from Squad. Never fall
+    // back to JSON.stringify here: re-serializing changes whitespace/order and
+    // could make an invalid request appear valid.
+    if (!signature || !secret || !Buffer.isBuffer(req.rawBody)) return false;
 
     const digest = crypto.createHmac('sha512', secret).update(req.rawBody).digest('hex');
     if (signature.length !== digest.length) return false;
@@ -359,6 +512,15 @@ function readSiteSetting(key, fallbackValue, callback) {
     );
 }
 
+function getSiteSetting(key, fallbackValue) {
+    return new Promise((resolve, reject) => {
+        readSiteSetting(key, fallbackValue, (err, value) => {
+            if (err) return reject(err);
+            resolve(value);
+        });
+    });
+}
+
 // Returns true when a table column already exists. Used to make schema
 // migrations idempotent and to gate write endpoints on required columns.
 function tableHasColumn(tableName, columnName) {
@@ -408,10 +570,8 @@ function ensureDepositSchema() {
                 { name: 'reviewed_at', type: 'DATETIME' }
             ];
             for (const col of required) {
-                // eslint-disable-next-line no-await-in-loop
                 const exists = await tableHasColumn('deposits', col.name);
                 if (!exists) {
-                    // eslint-disable-next-line no-await-in-loop
                     await addColumnIfMissingAsync('deposits', col.name, col.type);
                     console.warn(`[DB] deposits.${col.name} was missing and has been added.`);
                 }
@@ -461,6 +621,53 @@ async function withSqliteBusyRetry(operation, label = 'sqlite') {
     }
 }
 
+class ApiError extends Error {
+    constructor(status, message, code) {
+        super(message);
+        this.name = 'ApiError';
+        this.status = status;
+        this.code = code;
+    }
+}
+
+function apiError(status, message, code) {
+    return new ApiError(status, message, code);
+}
+
+async function withSqliteTransaction(operation, label = 'transaction') {
+    let release;
+    const previousTransaction = transactionTail;
+    transactionTail = new Promise((resolve) => {
+        release = resolve;
+    });
+    await previousTransaction;
+
+    return transactionStorage.run(true, async () => {
+        try {
+            await withSqliteBusyRetry(() => dbRunAsync('BEGIN IMMEDIATE TRANSACTION'), `${label}_begin`);
+            const result = await operation();
+            await dbRunAsync('COMMIT');
+            return result;
+        } catch (error) {
+            try {
+                await dbRunAsync('ROLLBACK');
+            } catch (rollbackError) {
+                console.error(`[DB] ${label} rollback failed:`, rollbackError.message);
+            }
+            throw error;
+        } finally {
+            release();
+        }
+    });
+}
+
+function sendApiError(res, error, fallbackMessage = 'Server error. Please try again.') {
+    const status = Number.isInteger(error?.status) ? error.status : 500;
+    const payload = { error: status === 500 ? fallbackMessage : error.message };
+    if (error?.code) payload.code = error.code;
+    return res.status(status).json(payload);
+}
+
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 15,
@@ -484,7 +691,7 @@ const webhookLimiter = rateLimit({
 // ==========================================
 const dbPath = process.env.RAILWAY_VOLUME_MOUNT_PATH
     ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'database.sqlite')
-    : './database.sqlite';
+    : path.join(__dirname, 'database.sqlite');
 
 const db = new sqlite3.Database(dbPath, (err) => {
     if (err) {
@@ -496,6 +703,30 @@ const db = new sqlite3.Database(dbPath, (err) => {
         });
     }
 });
+
+// Guard the callback-style sqlite3 methods as well as the Promise helpers. A
+// number of legacy endpoints still use db.get/db.run directly, so guarding only
+// dbRunAsync would leave money-changing transactions vulnerable to interleaving.
+const rawDbRun = db.run.bind(db);
+const rawDbGet = db.get.bind(db);
+const rawDbAll = db.all.bind(db);
+const rawDbClose = db.close.bind(db);
+db.run = function guardedRun(...args) {
+    const execute = () => rawDbRun(...args);
+    return transactionStorage.getStore() ? execute() : transactionTail.then(execute);
+};
+db.get = function guardedGet(...args) {
+    const execute = () => rawDbGet(...args);
+    return transactionStorage.getStore() ? execute() : transactionTail.then(execute);
+};
+db.all = function guardedAll(...args) {
+    const execute = () => rawDbAll(...args);
+    return transactionStorage.getStore() ? execute() : transactionTail.then(execute);
+};
+db.close = function guardedClose(...args) {
+    const execute = () => rawDbClose(...args);
+    return transactionTail.then(execute);
+};
 
 db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS users (
@@ -520,31 +751,51 @@ db.serialize(() => {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
+    // SQLite cannot add a column with UNIQUE or a non-constant default via
+    // ALTER TABLE. Existing production databases therefore need plain column
+    // types here; defaults are applied by the backfill below and by the INSERTs.
     const columnsToAdd = [
-        { name: 'balance', type: 'REAL DEFAULT 0' },
-        { name: 'wallet_balance', type: 'REAL DEFAULT 0' },
-        { name: 'taskEarnings', type: 'REAL DEFAULT 0' },
-        { name: 'daily_earnings', type: 'REAL DEFAULT 0' },
-        { name: 'affiliate_balance', type: 'REAL DEFAULT 0' },
-        { name: 'my_referral_id', type: 'TEXT UNIQUE' },
+        { name: 'balance', type: 'REAL' },
+        { name: 'wallet_balance', type: 'REAL' },
+        { name: 'taskEarnings', type: 'REAL' },
+        { name: 'daily_earnings', type: 'REAL' },
+        { name: 'affiliate_balance', type: 'REAL' },
+        { name: 'my_referral_id', type: 'TEXT' },
         { name: 'referred_by', type: 'TEXT' },
-        { name: 'planActivated', type: 'TEXT DEFAULT \'false\'' },
-        { name: 'activePackage', type: 'TEXT DEFAULT \'None\'' },
+        { name: 'planActivated', type: 'TEXT' },
+        { name: 'activePackage', type: 'TEXT' },
         { name: 'activePackageId', type: 'TEXT' },
-        { name: 'role', type: 'TEXT DEFAULT \'user\'' },
+        { name: 'role', type: 'TEXT' },
         { name: 'full_name', type: 'TEXT' },
         { name: 'phone', type: 'TEXT' },
         { name: 'bank_name', type: 'TEXT' },
         { name: 'bank_account_number', type: 'TEXT' },
         { name: 'bank_account_holder', type: 'TEXT' },
         { name: 'bank_code', type: 'TEXT' },
-        { name: 'created_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' },
-        { name: 'status', type: 'TEXT DEFAULT \'active\'' }
+        { name: 'created_at', type: 'DATETIME' },
+        { name: 'status', type: 'TEXT' }
+    ];
+
+    // Backfill values for columns added to an older database. These statements
+    // run after the ALTER statements because db.serialize queues them in order.
+    const userDefaults = [
+        ["UPDATE users SET balance = 0 WHERE balance IS NULL", []],
+        ["UPDATE users SET wallet_balance = COALESCE(balance, 0) WHERE wallet_balance IS NULL", []],
+        ["UPDATE users SET taskEarnings = 0 WHERE taskEarnings IS NULL", []],
+        ["UPDATE users SET daily_earnings = 0 WHERE daily_earnings IS NULL", []],
+        ["UPDATE users SET affiliate_balance = 0 WHERE affiliate_balance IS NULL", []],
+        ["UPDATE users SET planActivated = 'false' WHERE planActivated IS NULL OR TRIM(planActivated) = ''", []],
+        ["UPDATE users SET activePackage = 'None' WHERE activePackage IS NULL OR TRIM(activePackage) = ''", []],
+        ["UPDATE users SET role = 'user' WHERE role IS NULL OR TRIM(role) = ''", []],
+        ["UPDATE users SET status = 'active' WHERE status IS NULL OR TRIM(status) = ''", []],
+        ["UPDATE users SET created_at = datetime('now') WHERE created_at IS NULL", []]
     ];
 
     columnsToAdd.forEach((col) => addColumnIfMissing('users', col.name, col.type));
+    userDefaults.forEach(([sql, params]) => db.run(sql, params));
 
-    // Ensure main balances are synchronized for existing users
+    // Ensure main balances are synchronized for existing users. This preserves
+    // legacy data where only one of the two balance columns was populated.
     db.run(`UPDATE users SET wallet_balance = balance WHERE (wallet_balance IS NULL OR wallet_balance = 0) AND balance > 0`);
     db.run(`UPDATE users SET balance = wallet_balance WHERE (balance IS NULL OR balance = 0) AND wallet_balance > 0`);
 
@@ -599,13 +850,20 @@ db.serialize(() => {
     )`);
 
     const squadTransactionColumns = [
+        { name: 'username', type: 'TEXT' },
         { name: 'user_id', type: 'INTEGER' },
+        { name: 'email', type: 'TEXT' },
+        { name: 'amount', type: 'REAL' },
+        { name: 'reference', type: 'TEXT' },
         { name: 'payment_link', type: 'TEXT' },
+        { name: 'status', type: 'TEXT' },
         { name: 'provider_reference', type: 'TEXT' },
         { name: 'payload', type: 'TEXT' },
-        { name: 'processed_at', type: 'DATETIME' }
+        { name: 'processed_at', type: 'DATETIME' },
+        { name: 'created_at', type: 'DATETIME' }
     ];
     squadTransactionColumns.forEach((col) => addColumnIfMissing('squad_transactions', col.name, col.type));
+    db.run("UPDATE squad_transactions SET status = 'pending' WHERE status IS NULL OR TRIM(status) = ''");
 
     // ✅ UPDATED withdrawals table with all required columns
     db.run(`CREATE TABLE IF NOT EXISTS withdrawals (
@@ -622,18 +880,24 @@ db.serialize(() => {
         reviewed_at DATETIME,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
-    db.run(`ALTER TABLE withdrawals ADD COLUMN bank_details TEXT`, (err) => {
-        if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
-    });
-    db.run(`ALTER TABLE withdrawals ADD COLUMN admin_note TEXT`, (err) => {
-        if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
-    });
-    db.run(`ALTER TABLE withdrawals ADD COLUMN reviewed_by TEXT`, (err) => {
-        if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
-    });
-    db.run(`ALTER TABLE withdrawals ADD COLUMN reviewed_at DATETIME`, (err) => {
-        if (err && !err.message.includes('duplicate column name')) console.warn(err.message);
-    });
+    // Keep migrations compatible with SQLite's ALTER TABLE restrictions. All
+    // columns are plain types here; CREATE TABLE above supplies defaults for a
+    // new database and the request code supplies values for older databases.
+    const withdrawalColumnsToAdd = [
+        { name: 'username', type: 'TEXT' },
+        { name: 'amount', type: 'REAL' },
+        { name: 'fee', type: 'REAL' },
+        { name: 'total_deducted', type: 'REAL' },
+        { name: 'wallet_type', type: 'TEXT' },
+        { name: 'bank_details', type: 'TEXT' },
+        { name: 'status', type: 'TEXT' },
+        { name: 'admin_note', type: 'TEXT' },
+        { name: 'reviewed_by', type: 'TEXT' },
+        { name: 'reviewed_at', type: 'DATETIME' },
+        { name: 'created_at', type: 'DATETIME' }
+    ];
+    withdrawalColumnsToAdd.forEach((col) => addColumnIfMissing('withdrawals', col.name, col.type));
+    db.run("UPDATE withdrawals SET status = 'pending' WHERE status IS NULL OR TRIM(status) = ''");
 
     db.run(`CREATE TABLE IF NOT EXISTS site_settings (
         key TEXT PRIMARY KEY,
@@ -744,6 +1008,44 @@ db.serialize(() => {
         submitted_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
+    const dailyClaimColumns = [
+        { name: 'username', type: 'TEXT' },
+        { name: 'claim_date', type: 'TEXT' },
+        { name: 'amount', type: 'REAL' },
+        { name: 'created_at', type: 'DATETIME' }
+    ];
+    dailyClaimColumns.forEach((col) => addColumnIfMissing('daily_claims', col.name, col.type));
+
+    const sponsoredSubmissionColumns = [
+        { name: 'post_id', type: 'INTEGER' },
+        { name: 'username', type: 'TEXT' },
+        { name: 'status', type: 'TEXT' },
+        { name: 'submitted_at', type: 'DATETIME' }
+    ];
+    sponsoredSubmissionColumns.forEach((col) => addColumnIfMissing('sponsored_submissions', col.name, col.type));
+    db.run("UPDATE daily_claims SET created_at = datetime('now') WHERE created_at IS NULL");
+    db.run("UPDATE sponsored_submissions SET status = 'pending' WHERE status IS NULL OR TRIM(status) = ''");
+    // Remove duplicate legacy rows before adding uniqueness guarantees. The
+    // remaining earliest row is the authoritative historical record.
+    db.run(`DELETE FROM daily_claims
+            WHERE username IS NOT NULL AND claim_date IS NOT NULL
+              AND id NOT IN (
+                  SELECT MIN(id) FROM daily_claims
+                  WHERE username IS NOT NULL AND claim_date IS NOT NULL
+                  GROUP BY LOWER(username), claim_date
+              )`);
+    db.run(`DELETE FROM sponsored_submissions
+            WHERE post_id IS NOT NULL AND username IS NOT NULL
+              AND id NOT IN (
+                  SELECT MIN(id) FROM sponsored_submissions
+                  WHERE post_id IS NOT NULL AND username IS NOT NULL
+                  GROUP BY post_id, LOWER(username)
+              )`);
+    db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_claims_user_date ON daily_claims(LOWER(username), claim_date)');
+    db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_sponsored_submissions_post_user ON sponsored_submissions(post_id, LOWER(username))');
+    db.run('CREATE INDEX IF NOT EXISTS idx_deposits_transaction_ref ON deposits(transaction_ref)');
+    db.run('CREATE INDEX IF NOT EXISTS idx_squad_transactions_reference ON squad_transactions(reference)');
+
     db.run(`CREATE TABLE IF NOT EXISTS investment_packages (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -784,13 +1086,15 @@ db.serialize(() => {
         { name: 'cycle_days', type: 'INTEGER' },
         { name: 'daily_earning', type: 'REAL' },
         { name: 'total_payout', type: 'REAL' },
-        { name: 'referral_bonus', type: 'REAL DEFAULT 0' },
-        { name: 'updated_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' }
+        { name: 'referral_bonus', type: 'REAL' },
+        { name: 'updated_at', type: 'DATETIME' }
     ];
 
     investmentPackageColumns.forEach((col) => addColumnIfMissing('investment_packages', col.name, col.type));
 
     const userInvestmentColumns = [
+        { name: 'user_id', type: 'INTEGER' },
+        { name: 'username', type: 'TEXT' },
         { name: 'package_id', type: 'TEXT' },
         { name: 'package_name', type: 'TEXT' },
         { name: 'capital', type: 'REAL' },
@@ -798,14 +1102,67 @@ db.serialize(() => {
         { name: 'cycle_days', type: 'INTEGER' },
         { name: 'daily_earning', type: 'REAL' },
         { name: 'total_payout', type: 'REAL' },
-        { name: 'referral_bonus', type: 'REAL DEFAULT 0' },
-        { name: 'days_credited', type: 'INTEGER DEFAULT 0' },
-        { name: 'status', type: "TEXT DEFAULT 'active'" },
-        { name: 'activated_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' },
+        { name: 'referral_bonus', type: 'REAL' },
+        { name: 'days_credited', type: 'INTEGER' },
+        { name: 'status', type: 'TEXT' },
+        { name: 'activated_at', type: 'DATETIME' },
         { name: 'completed_at', type: 'DATETIME' }
     ];
 
     userInvestmentColumns.forEach((col) => addColumnIfMissing('user_investments', col.name, col.type));
+
+    // Complete the same idempotent migration for the smaller legacy tables.
+    // Older database files predate several of these columns, and CREATE TABLE
+    // IF NOT EXISTS does not alter an existing table.
+    const legacyTableColumns = {
+        ads: [
+            ['username', 'TEXT'], ['title', 'TEXT'], ['url', 'TEXT'], ['image', 'TEXT'],
+            ['price', 'REAL'], ['status', 'TEXT'], ['created_at', 'DATETIME']
+        ],
+        bills: [
+            ['username', 'TEXT'], ['bill_type', 'TEXT'], ['network', 'TEXT'], ['phone', 'TEXT'],
+            ['amount', 'REAL'], ['status', 'TEXT'], ['created_at', 'DATETIME']
+        ],
+        bulk_sms: [
+            ['username', 'TEXT'], ['sender_id', 'TEXT'], ['recipients_count', 'INTEGER'],
+            ['total_cost', 'REAL'], ['status', 'TEXT'], ['created_at', 'DATETIME']
+        ],
+        messages: [
+            ['user_id', 'TEXT'], ['sender', 'TEXT'], ['message', 'TEXT'], ['created_at', 'DATETIME']
+        ],
+        broadcasts: [
+            ['title', 'TEXT'], ['message', 'TEXT'], ['created_by', 'TEXT'], ['created_at', 'DATETIME']
+        ],
+        sponsored_posts: [
+            ['title', 'TEXT'], ['description', 'TEXT'], ['reward_amount', 'REAL'],
+            ['required_plan', 'TEXT'], ['image_url', 'TEXT'], ['link', 'TEXT'],
+            ['status', 'TEXT'], ['created_by', 'TEXT'], ['created_at', 'DATETIME']
+        ],
+        sponsored_submissions: [
+            ['post_id', 'INTEGER'], ['username', 'TEXT'], ['status', 'TEXT'], ['submitted_at', 'DATETIME']
+        ],
+        admin_activity_log: [
+            ['admin_username', 'TEXT'], ['target_username', 'TEXT'], ['action', 'TEXT'],
+            ['details', 'TEXT'], ['created_at', 'DATETIME']
+        ],
+        system_migrations: [
+            ['migration_key', 'TEXT'], ['status', 'TEXT'], ['started_by', 'TEXT'], ['notes', 'TEXT'],
+            ['started_at', 'DATETIME'], ['completed_at', 'DATETIME'], ['updated_at', 'DATETIME']
+        ]
+    };
+    Object.entries(legacyTableColumns).forEach(([tableName, columns]) => {
+        columns.forEach(([name, type]) => addColumnIfMissing(tableName, name, type));
+    });
+
+    db.run("UPDATE investment_packages SET referral_bonus = COALESCE(referral_bonus, 0) WHERE referral_bonus IS NULL");
+    db.run("UPDATE user_investments SET days_credited = 0 WHERE days_credited IS NULL");
+    db.run("UPDATE user_investments SET status = 'active' WHERE status IS NULL OR TRIM(status) = ''");
+    db.run("UPDATE user_investments SET activated_at = datetime('now') WHERE activated_at IS NULL");
+    db.run("UPDATE ads SET status = 'active' WHERE status IS NULL OR TRIM(status) = ''");
+    db.run("UPDATE sponsored_posts SET status = 'active' WHERE status IS NULL OR TRIM(status) = ''");
+    db.run("UPDATE sponsored_submissions SET status = 'pending' WHERE status IS NULL OR TRIM(status) = ''");
+    db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_system_migrations_key ON system_migrations(migration_key)');
+    db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_id ON users(my_referral_id) WHERE my_referral_id IS NOT NULL');
 
     const upsertPackageQuery = `
         INSERT INTO investment_packages (id, name, tier, capital, daily_rate, cycle_days, daily_earning, total_payout, referral_bonus, updated_at)
@@ -882,7 +1239,25 @@ db.serialize(() => {
     }, 500);
 });
 
+// Lightweight deployment probe. A frontend can distinguish "the API is down"
+// from a bad username/password, and Railway/other hosts can use this endpoint
+// as a health check without needing an auth token.
+app.get(['/health', '/api/health'], (req, res) => {
+    db.get('SELECT 1 AS ok', [], (err) => {
+        if (err) {
+            console.error('Health check database error:', err.message);
+            return res.status(503).json({ status: 'error', database: 'unavailable' });
+        }
+        if (!jwtSecret) {
+            return res.status(503).json({ status: 'error', database: 'ok', authentication: 'not_configured' });
+        }
+        return res.json({ status: 'ok', database: 'ok', authentication: 'ok' });
+    });
+});
+
 const authenticateToken = (req, res, next) => {
+    if (!requireJwtSecret(res)) return;
+
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.status(401).json({ error: "Access token required", code: "TOKEN_MISSING" });
@@ -916,7 +1291,10 @@ const authenticateToken = (req, res, next) => {
 function validateUserStatus(req, res, next) {
     db.get(`SELECT status FROM users WHERE id = ?`, [req.user.id], (statusErr, statusRow) => {
         if (statusErr) return res.status(500).json({ error: "Server error while validating account status" });
-        if (statusRow && statusRow.status === 'banned') {
+        if (!statusRow) {
+            return res.status(403).json({ error: "Invalid or expired token. Please log in again.", code: "TOKEN_INVALID" });
+        }
+        if (String(statusRow.status || '').toLowerCase() === 'banned') {
             return res.status(403).json({ error: "Your account has been suspended. Please contact support." });
         }
         next();
@@ -931,123 +1309,132 @@ const adminOnly = (req, res, next) => {
 // ==========================================
 // 1. LIVE SYNC & AUTHENTICATION
 // ==========================================
-app.get('/api/user/:username', authenticateToken, (req, res) => {
-    if (req.user.role !== 'admin' && req.user.username.toLowerCase() !== req.params.username.toLowerCase()) {
-        return res.status(403).json({ error: "Unauthorized access to another user's profile" });
+app.post('/api/user/sync', authenticateToken, async (req, res) => {
+    try {
+        const user = await dbGetAsync(`SELECT * FROM users WHERE LOWER(username) = LOWER(?)`, [req.user.username]);
+        if (!user) return res.status(404).json({ error: "User not found" });
+        return res.json({ success: true, user: serializeUser(user) });
+    } catch (error) {
+        return sendApiError(res, error, 'Unable to synchronize user profile.');
     }
-    const query = `SELECT id, username, balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance, my_referral_id, referred_by, planActivated, activePackage, activePackageId, role, full_name, phone, bank_name, bank_account_number, bank_account_holder, created_at FROM users WHERE LOWER(username) = LOWER(?)`;
-    db.get(query, [req.params.username], (err, user) => {
-        if (err || !user) return res.status(404).json({ error: "User not found" });
-        res.json({ success: true, user: serializeUser(user) });
-    });
-});
-
-app.post('/api/user/sync', authenticateToken, (req, res) => {
-    const username = req.user.username;
-    const query = `SELECT * FROM users WHERE LOWER(username) = LOWER(?)`;
-    db.get(query, [username], (err, user) => {
-        if (err || !user) return res.status(404).json({ error: "User not found" });
-        res.json({ success: true, user: serializeUser(user) });
-    });
 });
 
 app.post('/api/register', authLimiter, async (req, res) => {
+    if (!requireJwtSecret(res)) return;
+
     try {
-        const { username, password, referred_by } = req.body;
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const username = typeof body.username === 'string' ? body.username.trim() : '';
+        const password = typeof body.password === 'string' ? body.password : '';
+        const referredByRaw = typeof body.referred_by === 'string' ? body.referred_by.trim() : '';
+
         if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
         if (!/^[a-zA-Z0-9_.@-]{3,50}$/.test(username)) return res.status(400).json({ error: 'Invalid username/email format' });
         if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
 
-        db.get(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, existing) => {
-            if (err) {
-                console.error("DB error on username check:", err.message);
-                return res.status(500).json({ error: "Database error, please try again" });
-            }
-            if (existing) return res.status(400).json({ error: "Username already taken. Please choose another." });
+        const registrationsOpen = await getSiteSetting('registrations_open', 'true');
+        if (!isTrueFlag(registrationsOpen)) {
+            return res.status(403).json({ error: 'New registrations are currently disabled.' });
+        }
 
-            const my_referral_id = "AW" + crypto.randomBytes(4).toString('hex').toUpperCase();
-            const hashedPassword = await bcryptjs.hash(password, 10);
-            const referredByRaw = (referred_by || '').toString().trim();
+        const existing = await dbGetAsync(
+            `SELECT id FROM users WHERE LOWER(username) = LOWER(?)`,
+            [username]
+        );
+        if (existing) return res.status(400).json({ error: "Username already taken. Please choose another." });
 
-            const insertUser = (normalizedReferredBy) => {
-                db.run(`INSERT INTO users (username, password, my_referral_id, referred_by, role) VALUES (?, ?, ?, ?, 'user')`,
-                    [username, hashedPassword, my_referral_id, normalizedReferredBy || null], function (err) {
-                        if (err) {
-                            console.error("Registration insert error:", err.message);
-                            if (err.message.includes("UNIQUE constraint failed: users.username")) {
-                                return res.status(400).json({ error: "Username already taken (duplicate)." });
-                            }
-                            if (err.message.includes("UNIQUE constraint failed: users.my_referral_id")) {
-                                return res.status(500).json({ error: "System error: please try again." });
-                            }
-                            return res.status(500).json({ error: "Database error: " + err.message });
-                        }
-                        const token = signAccessToken({ id: this.lastID, username, role: 'user' });
-                        // Return the full normalized user so the frontend never
-                        // treats a brand-new account as "incomplete" because of
-                        // missing fields.
-                        db.get(`SELECT * FROM users WHERE id = ?`, [this.lastID], (fetchErr, newUser) => {
-                            res.json({
-                                success: true,
-                                message: "Registration successful!",
-                                token,
-                                user: serializeUser(newUser || {
-                                    id: this.lastID,
-                                    username,
-                                    role: 'user',
-                                    my_referral_id
-                                })
-                            });
-                        });
-                    });
-            };
-
-            if (!referredByRaw) {
-                return insertUser(null);
-            }
-
-            db.get(
+        let normalizedReferredBy = null;
+        if (referredByRaw) {
+            const refUser = await dbGetAsync(
                 `SELECT my_referral_id, username
                  FROM users
                  WHERE LOWER(my_referral_id) = LOWER(?) OR LOWER(username) = LOWER(?)
                  LIMIT 1`,
-                [referredByRaw, referredByRaw],
-                (refErr, refUser) => {
-                    if (refErr) {
-                        return res.status(500).json({ error: "Database error, please try again" });
-                    }
-
-                    if (!refUser) {
-                        return res.status(400).json({ error: "Invalid referral code." });
-                    }
-
-                    insertUser(refUser.my_referral_id || referredByRaw);
-                }
+                [referredByRaw, referredByRaw]
             );
+            if (!refUser) return res.status(400).json({ error: "Invalid referral code." });
+            normalizedReferredBy = refUser.my_referral_id || refUser.username;
+        }
+
+        const myReferralId = `AW${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+        const hashedPassword = await bcryptjs.hash(password, 10);
+        const insertResult = await dbRunAsync(
+            `INSERT INTO users (username, password, my_referral_id, referred_by, role, status)
+             VALUES (?, ?, ?, ?, 'user', 'active')`,
+            [username, hashedPassword, myReferralId, normalizedReferredBy]
+        );
+        const userId = insertResult.lastID;
+        const token = signAccessToken({ id: userId, username, role: 'user' });
+        const newUser = await dbGetAsync(`SELECT * FROM users WHERE id = ?`, [userId]);
+
+        return res.json({
+            success: true,
+            message: "Registration successful!",
+            token,
+            user: serializeUser(newUser || {
+                id: userId,
+                username,
+                role: 'user',
+                status: 'active',
+                my_referral_id: myReferralId
+            })
         });
     } catch (error) {
-        console.error('Registration catch error:', error);
-        res.status(500).json({ error: 'Registration failed due to server error.' });
+        console.error('Registration error:', error.message);
+        if (String(error.message || '').includes('UNIQUE constraint failed: users.username')) {
+            return res.status(400).json({ error: "Username already taken. Please choose another." });
+        }
+        if (String(error.message || '').includes('UNIQUE constraint failed: users.my_referral_id')) {
+            return res.status(409).json({ error: "Could not create a unique referral ID. Please try again." });
+        }
+        return res.status(500).json({ error: 'Registration failed due to server error.' });
     }
 });
 
 app.post('/api/login', authLimiter, async (req, res) => {
+    if (!requireJwtSecret(res)) return;
+
     try {
-        const { username, password } = req.body;
-        if (!username || !password) return res.status(400).json({ error: "Username and password required" });
-        db.get(`SELECT * FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
-            if (err || !user) return res.status(400).json({ error: "Invalid username or password" });
-            const passwordMatch = await bcryptjs.compare(password, user.password);
-            if (!passwordMatch) return res.status(400).json({ error: "Invalid username or password" });
-            const token = signAccessToken(user);
-            res.json({
-                success: true,
-                token,
-                user: serializeUser(user)
-            });
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const username = typeof body.username === 'string' ? body.username.trim() : '';
+        // Passwords are deliberately not trimmed: spaces can be valid password
+        // characters and changing them here would make a valid login fail.
+        const password = typeof body.password === 'string' ? body.password : '';
+
+        if (!username || !password) {
+            return res.status(400).json({ error: "Username and password required" });
+        }
+
+        const user = await dbGetAsync(
+            `SELECT * FROM users WHERE LOWER(username) = LOWER(?)`,
+            [username]
+        );
+
+        if (!user || typeof user.password !== 'string') {
+            return res.status(400).json({ error: "Invalid username or password" });
+        }
+        if (String(user.status || '').toLowerCase() === 'banned') {
+            return res.status(403).json({ error: "Your account has been suspended. Please contact support." });
+        }
+
+        const passwordMatch = await bcryptjs.compare(password, user.password);
+        if (!passwordMatch) {
+            return res.status(400).json({ error: "Invalid username or password" });
+        }
+
+        const token = signAccessToken(user);
+        return res.json({
+            success: true,
+            token,
+            user: serializeUser(user)
         });
     } catch (error) {
-        res.status(500).json({ error: 'Login failed' });
+        // Keep database/bcrypt/JWT failures inside the request lifecycle. The
+        // old callback-based implementation could reject after the outer
+        // try/catch had already returned, leaving the socket open; fetch then
+        // surfaced that as "Network error" instead of a useful API response.
+        console.error('Login error:', error);
+        return res.status(500).json({ error: 'Login failed. Please try again.' });
     }
 });
 
@@ -1055,20 +1442,23 @@ async function createSquadDepositLink(req, res) {
     try {
         if (!ensureSquadConfigured(res)) return;
 
-        const { amount, email, user_id } = req.body;
-        if (!isValidAmount(amount) || !isValidEmail(email) || !user_id) return res.status(400).json({ error: "Amount, email, and user_id are required" });
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const { amount, email, user_id } = body;
+        if (!isValidAmount(amount) || !isValidEmail(email) || user_id === undefined || user_id === null) {
+            return res.status(400).json({ error: "Amount, email, and user_id are required" });
+        }
         if (Number(user_id) !== Number(req.user.id)) {
             return res.status(403).json({ error: 'Invalid user_id for authenticated account.' });
         }
 
-        const normalizedAmount = parseFloat(amount);
+        const normalizedAmount = toFiniteNumber(amount);
         const amountInKobo = Math.round(normalizedAmount * 100);
         const reference = `AW-DEPOSIT-${Date.now()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
         const squadPaymentLinkUrl = `${getSquadApiUrl().replace(/\/$/, '')}/transaction/initiate`;
         const callbackUrl = process.env.SQUAD_CALLBACK_URL || 'https://accesswealthhq.com/dashboard';
 
         const payload = {
-            email,
+            email: email.trim(),
             amount: amountInKobo,
             currency: 'NGN',
             initiate_type: 'inline',
@@ -1104,15 +1494,15 @@ async function createSquadDepositLink(req, res) {
             return res.status(500).json({ error: 'Squad did not return a payment link.' });
         }
 
-        db.run(
-            `INSERT INTO squad_transactions (username, user_id, email, amount, reference, payment_link, provider_reference, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
-            [req.user.username, req.user.id, email, normalizedAmount, reference, checkoutUrl, providerReference],
-            function (err) {
-                if (err) return res.status(500).json({ error: 'Failed to create Squad transaction record.' });
-                res.json({ success: true, checkout_url: checkoutUrl, payment_link: checkoutUrl, reference });
-            }
+        await withSqliteBusyRetry(
+            () => dbRunAsync(
+                `INSERT INTO squad_transactions (username, user_id, email, amount, reference, payment_link, provider_reference, status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+                [req.user.username, req.user.id, email.trim(), normalizedAmount, reference, checkoutUrl, providerReference]
+            ),
+            'squad_transaction_insert'
         );
+        return res.json({ success: true, checkout_url: checkoutUrl, payment_link: checkoutUrl, reference });
     } catch (error) {
         res.status(500).json({ error: 'Server error during Squad payment link initialization.' });
     }
@@ -1125,23 +1515,29 @@ async function createSquadDepositLink(req, res) {
 // to log in again. We intentionally accept tokens up to 7 days past expiry to
 // smooth over long gaps; anything older requires a fresh login.
 app.post('/api/refresh-token', actionLimiter, (req, res) => {
+    if (!requireJwtSecret(res)) return;
+
     const authHeader = req.headers['authorization'];
     const incomingToken = authHeader && authHeader.split(' ')[1];
     if (!incomingToken) {
         return res.status(401).json({ error: "Access token required", code: "TOKEN_MISSING" });
     }
 
-    const finishWithUser = (payload) => {
-        db.get(`SELECT * FROM users WHERE id = ?`, [payload.id], (err, user) => {
-            if (err || !user) {
+    const finishWithUser = async (payload) => {
+        try {
+            const user = await dbGetAsync(`SELECT * FROM users WHERE id = ?`, [payload.id]);
+            if (!user) {
                 return res.status(401).json({ error: "Account no longer exists.", code: "TOKEN_INVALID" });
             }
-            if (user.status === 'banned') {
+            if (String(user.status || '').toLowerCase() === 'banned') {
                 return res.status(403).json({ error: "Your account has been suspended. Please contact support." });
             }
             const freshToken = signAccessToken(user);
-            res.json({ success: true, token: freshToken, user: serializeUser(user) });
-        });
+            return res.json({ success: true, token: freshToken, user: serializeUser(user) });
+        } catch (error) {
+            console.error('Token refresh error:', error.message);
+            return sendApiError(res, error, 'Unable to refresh your session. Please log in again.');
+        }
     };
 
     // Try strict verification first.
@@ -1297,7 +1693,7 @@ app.get('/api/packages', (req, res) => {
     );
 });
 
-app.post('/api/admin/packages/reseed', authenticateToken, adminOnly, (req, res) => {
+app.post('/api/admin/packages/reseed', authenticateToken, adminOnly, async (req, res) => {
     const upsertPackageQuery = `
         INSERT INTO investment_packages (id, name, tier, capital, daily_rate, cycle_days, daily_earning, total_payout, referral_bonus, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
@@ -1313,131 +1709,123 @@ app.post('/api/admin/packages/reseed', authenticateToken, adminOnly, (req, res) 
             updated_at = datetime('now')
     `;
 
-    let completed = 0;
-    let hasFailed = false;
-
-    FIXED_PACKAGES.forEach((pkg) => {
-        db.run(
-            upsertPackageQuery,
-            [
-                pkg.id,
-                pkg.name,
-                pkg.tier,
-                pkg.capital,
-                pkg.daily_rate,
-                pkg.cycle_days,
-                pkg.daily_earning,
-                pkg.total_payout,
-                getReferralBonus(pkg)
-            ],
-            (err) => {
-                if (hasFailed) return;
-
-                if (err) {
-                    hasFailed = true;
-                    return res.status(500).json({ error: `Failed to reseed package ${pkg.id}: ${err.message}` });
-                }
-
-                completed += 1;
-                if (completed === FIXED_PACKAGES.length) {
-                    res.json({
-                        success: true,
-                        message: 'Investment packages reseeded successfully.',
-                        total: FIXED_PACKAGES.length
-                    });
-                }
+    try {
+        await withSqliteTransaction(async () => {
+            for (const pkg of FIXED_PACKAGES) {
+                await dbRunAsync(
+                    upsertPackageQuery,
+                    [
+                        pkg.id,
+                        pkg.name,
+                        pkg.tier,
+                        pkg.capital,
+                        pkg.daily_rate,
+                        pkg.cycle_days,
+                        pkg.daily_earning,
+                        pkg.total_payout,
+                        getReferralBonus(pkg)
+                    ]
+                );
             }
-        );
-    });
+        }, 'reseed_packages');
+        return res.json({
+            success: true,
+            message: 'Investment packages reseeded successfully.',
+            total: FIXED_PACKAGES.length
+        });
+    } catch (error) {
+        console.error('Package reseed error:', error.message);
+        return sendApiError(res, error, 'Failed to reseed investment packages.');
+    }
 });
 
-app.post('/api/activate', authenticateToken, actionLimiter, (req, res) => {
-    const packageId = (req.body.package_id || req.body.packageId || '').toString().trim().toLowerCase();
-    const fallbackName = (req.body.name || '').toString().trim().toLowerCase();
+app.post('/api/activate', authenticateToken, actionLimiter, async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const packageId = (body.package_id || body.packageId || '').toString().trim().toLowerCase();
+    const fallbackName = (body.name || '').toString().trim().toLowerCase();
     const selectedPackage = PACKAGE_BY_ID[packageId] || PACKAGE_BY_NAME[fallbackName];
 
     if (!selectedPackage) {
         return res.status(400).json({ error: 'Invalid package selection.' });
     }
 
-    db.get(`SELECT * FROM users WHERE id = ?`, [req.user.id], (err, user) => {
-        if (err || !user) return res.status(400).json({ error: 'User not found' });
-        if (user.planActivated === 'true') {
-            return res.status(400).json({ error: 'You already have an active package' });
-        }
-        if (user.balance < selectedPackage.capital) {
-            return res.status(400).json({ error: 'Insufficient deposit balance.' });
-        }
-
-        db.get(`SELECT id FROM user_investments WHERE user_id = ? AND status = 'active' LIMIT 1`, [req.user.id], (invErr, activeInvestment) => {
-            if (invErr) return res.status(500).json({ error: 'Database error.' });
-            if (activeInvestment) {
-                return res.status(400).json({ error: 'You already have an active package cycle.' });
+    try {
+        const result = await withSqliteTransaction(async () => {
+            const user = await dbGetAsync(`SELECT * FROM users WHERE id = ?`, [req.user.id]);
+            if (!user) throw apiError(404, 'User not found.');
+            if (isTrueFlag(user.planActivated)) {
+                throw apiError(409, 'You already have an active package.');
             }
 
-            const newBalance = user.balance - selectedPackage.capital;
-            const referralBonus = getReferralBonus(selectedPackage);
+            const currentBalance = toFiniteNumber(user.balance) || 0;
+            if (currentBalance < selectedPackage.capital) {
+                throw apiError(400, 'Insufficient deposit balance.');
+            }
 
-            db.run(
+            const activeInvestment = await dbGetAsync(
+                `SELECT id FROM user_investments WHERE user_id = ? AND status = 'active' LIMIT 1`,
+                [req.user.id]
+            );
+            if (activeInvestment) {
+                throw apiError(409, 'You already have an active package cycle.');
+            }
+
+            const newBalance = currentBalance - selectedPackage.capital;
+            const referralBonus = getReferralBonus(selectedPackage);
+            const updateResult = await dbRunAsync(
                 `UPDATE users
                  SET balance = ?, wallet_balance = ?, planActivated = 'true', activePackage = ?, activePackageId = ?
-                 WHERE id = ? AND planActivated = 'false'`,
-                [newBalance, newBalance, selectedPackage.name, selectedPackage.id, req.user.id],
-                function (updateErr) {
-                    if (updateErr) return res.status(500).json({ error: 'Database error.' });
-                    if (this.changes === 0) {
-                        return res.status(400).json({ error: 'Plan already activated or balance insufficient.' });
-                    }
-
-                    db.run(
-                        `INSERT INTO user_investments
-                         (user_id, username, package_id, package_name, capital, daily_rate, cycle_days, daily_earning, total_payout, referral_bonus, days_credited, status, activated_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', datetime('now'))`,
-                        [
-                            req.user.id,
-                            user.username,
-                            selectedPackage.id,
-                            selectedPackage.name,
-                            selectedPackage.capital,
-                            selectedPackage.daily_rate,
-                            selectedPackage.cycle_days,
-                            selectedPackage.daily_earning,
-                            selectedPackage.total_payout,
-                            referralBonus
-                        ],
-                        function (insertErr) {
-                            if (insertErr) {
-                                // Roll back user activation if investment row fails.
-                                db.run(
-                                    `UPDATE users SET balance = ?, wallet_balance = ?, planActivated = 'false', activePackage = 'None', activePackageId = NULL WHERE id = ?`,
-                                    [user.balance, user.balance, req.user.id]
-                                );
-                                return res.status(500).json({ error: 'Failed to create package cycle.' });
-                            }
-
-                            if (user.referred_by) {
-                                db.run(
-                                    `UPDATE users
-                                     SET affiliate_balance = COALESCE(affiliate_balance, 0) + ?
-                                     WHERE id != ? AND (
-                                        LOWER(my_referral_id) = LOWER(?) OR LOWER(username) = LOWER(?)
-                                     )`,
-                                    [referralBonus, req.user.id, user.referred_by, user.referred_by]
-                                );
-                            }
-
-                            res.json({
-                                success: true,
-                                message: `Package ${selectedPackage.name} activated successfully.`,
-                                newBalance,
-                                package: serializePackageForApi(selectedPackage)
-                            });
-                        }
-                    );
-                }
+                 WHERE id = ?
+                   AND LOWER(CAST(COALESCE(planActivated, 'false') AS TEXT)) NOT IN ('true', '1')
+                   AND COALESCE(balance, 0) >= ?`,
+                [newBalance, newBalance, selectedPackage.name, selectedPackage.id, req.user.id, selectedPackage.capital]
             );
+            if (!updateResult.changes) {
+                throw apiError(409, 'Plan activation could not be completed. Please refresh and try again.');
+            }
+
+            await dbRunAsync(
+                `INSERT INTO user_investments
+                 (user_id, username, package_id, package_name, capital, daily_rate, cycle_days, daily_earning, total_payout, referral_bonus, days_credited, status, activated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', datetime('now'))`,
+                [
+                    req.user.id,
+                    user.username,
+                    selectedPackage.id,
+                    selectedPackage.name,
+                    selectedPackage.capital,
+                    selectedPackage.daily_rate,
+                    selectedPackage.cycle_days,
+                    selectedPackage.daily_earning,
+                    selectedPackage.total_payout,
+                    referralBonus
+                ]
+            );
+
+            if (user.referred_by) {
+                await dbRunAsync(
+                    `UPDATE users
+                     SET affiliate_balance = COALESCE(affiliate_balance, 0) + ?
+                     WHERE id != ? AND (
+                        LOWER(my_referral_id) = LOWER(?) OR LOWER(username) = LOWER(?)
+                     )`,
+                    [referralBonus, req.user.id, user.referred_by, user.referred_by]
+                );
+            }
+
+            return { newBalance };
+        }, 'activate_package');
+
+        return res.json({
+            success: true,
+            message: `Package ${selectedPackage.name} activated successfully.`,
+            newBalance: result.newBalance,
+            package: serializePackageForApi(selectedPackage)
         });
-    });
+    } catch (error) {
+        console.error('Package activation error:', error.message);
+        return sendApiError(res, error, 'Failed to activate package. Please try again.');
+    }
 });
 
 // GET the authenticated user's currently active investment cycle (or null).
@@ -1480,183 +1868,209 @@ app.get('/api/active-investment', authenticateToken, async (req, res) => {
 // current cycle is ended with status 'upgraded' and a fresh cycle for the new
 // package begins immediately. Daily earnings already credited are kept.
 app.post('/api/upgrade-package', authenticateToken, actionLimiter, async (req, res) => {
-    const packageId = (req.body.package_id || req.body.packageId || '').toString().trim().toLowerCase();
-    const fallbackName = (req.body.name || '').toString().trim().toLowerCase();
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const packageId = (body.package_id || body.packageId || '').toString().trim().toLowerCase();
+    const fallbackName = (body.name || '').toString().trim().toLowerCase();
     const targetPackage = PACKAGE_BY_ID[packageId] || PACKAGE_BY_NAME[fallbackName];
 
     if (!targetPackage) {
         return res.status(400).json({ error: 'Invalid package selection.' });
     }
 
-    let transactionOpen = false;
     try {
-        const user = await dbGetAsync(
-            `SELECT id, username, balance, wallet_balance, referred_by FROM users WHERE id = ?`,
-            [req.user.id]
-        );
-        if (!user) return res.status(404).json({ error: 'User not found.' });
-
-        const current = await dbGetAsync(
-            `SELECT id, package_id, package_name, capital FROM user_investments
-             WHERE user_id = ? AND status = 'active'
-             ORDER BY activated_at DESC LIMIT 1`,
-            [req.user.id]
-        );
-
-        if (!current) {
-            return res.status(400).json({
-                error: 'You do not have an active package to upgrade. Please activate a package first.'
-            });
-        }
-
-        if (targetPackage.capital <= current.capital) {
-            return res.status(400).json({
-                error: 'You can only upgrade to a higher package. Please select a package with a larger capital.'
-            });
-        }
-
-        const upgradeCost = targetPackage.capital - current.capital;
-        const currentBalance = Number(user.wallet_balance ?? user.balance ?? 0);
-        if (currentBalance < upgradeCost) {
-            return res.status(400).json({
-                error: `Insufficient balance to upgrade. You need ₦${upgradeCost.toLocaleString()} more.`
-            });
-        }
-
-        const referralBonus = Math.round(upgradeCost * 0.5);
-        const newBalance = currentBalance - upgradeCost;
-
-        await dbRunAsync('BEGIN IMMEDIATE TRANSACTION');
-        transactionOpen = true;
-
-        // End the current cycle.
-        await dbRunAsync(
-            `UPDATE user_investments
-             SET status = 'upgraded', completed_at = datetime('now')
-             WHERE id = ? AND status = 'active'`,
-            [current.id]
-        );
-
-        // Deduct only the difference.
-        await dbRunAsync(
-            `UPDATE users
-             SET balance = COALESCE(balance, 0) - ?,
-                 wallet_balance = COALESCE(wallet_balance, 0) - ?,
-                 activePackage = ?, activePackageId = ?, planActivated = 'true'
-             WHERE id = ?`,
-            [upgradeCost, upgradeCost, targetPackage.name, targetPackage.id, req.user.id]
-        );
-
-        // Start the new (upgraded) cycle fresh.
-        await dbRunAsync(
-            `INSERT INTO user_investments
-             (user_id, username, package_id, package_name, capital, daily_rate, cycle_days,
-              daily_earning, total_payout, referral_bonus, days_credited, status, activated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', datetime('now'))`,
-            [
-                req.user.id,
-                user.username,
-                targetPackage.id,
-                targetPackage.name,
-                targetPackage.capital,
-                targetPackage.daily_rate,
-                targetPackage.cycle_days,
-                targetPackage.daily_earning,
-                targetPackage.total_payout,
-                getReferralBonus(targetPackage)
-            ]
-        );
-
-        // Award the referrer a bonus on the new money committed (the upgrade
-        // difference), consistent with the referral bonus paid on activation.
-        if (user.referred_by) {
-            await dbRunAsync(
-                `UPDATE users
-                 SET affiliate_balance = COALESCE(affiliate_balance, 0) + ?
-                 WHERE id != ? AND (
-                    LOWER(my_referral_id) = LOWER(?) OR LOWER(username) = LOWER(?)
-                 )`,
-                [referralBonus, req.user.id, user.referred_by, user.referred_by]
+        const result = await withSqliteTransaction(async () => {
+            const user = await dbGetAsync(
+                `SELECT id, username, balance, wallet_balance, referred_by FROM users WHERE id = ?`,
+                [req.user.id]
             );
-        }
+            if (!user) throw apiError(404, 'User not found.');
 
-        await dbRunAsync('COMMIT');
-        transactionOpen = false;
+            const current = await dbGetAsync(
+                `SELECT id, package_id, package_name, capital FROM user_investments
+                 WHERE user_id = ? AND status = 'active'
+                 ORDER BY activated_at DESC LIMIT 1`,
+                [req.user.id]
+            );
+            if (!current) {
+                throw apiError(400, 'You do not have an active package to upgrade. Please activate a package first.');
+            }
 
-        console.warn(`[UPGRADE] ${user.username} upgraded from ${current.package_name} to ${targetPackage.name} (cost ₦${upgradeCost})`);
+            const currentCapital = toFiniteNumber(current.capital);
+            if (currentCapital === null) throw new Error('Active package has an invalid capital value.');
+            if (targetPackage.capital <= currentCapital) {
+                throw apiError(400, 'You can only upgrade to a higher package. Please select a package with a larger capital.');
+            }
 
-        res.json({
+            const upgradeCost = targetPackage.capital - currentCapital;
+            const currentBalance = toFiniteNumber(user.wallet_balance ?? user.balance) || 0;
+            if (currentBalance < upgradeCost) {
+                throw apiError(400, `Insufficient balance to upgrade. You need ₦${upgradeCost.toLocaleString()} more.`);
+            }
+
+            const oldCycleResult = await dbRunAsync(
+                `UPDATE user_investments
+                 SET status = 'upgraded', completed_at = datetime('now')
+                 WHERE id = ? AND status = 'active'`,
+                [current.id]
+            );
+            if (!oldCycleResult.changes) {
+                throw apiError(409, 'This package was already upgraded. Please refresh and try again.');
+            }
+
+            const newBalance = currentBalance - upgradeCost;
+            const userUpdate = await dbRunAsync(
+                `UPDATE users
+                 SET balance = COALESCE(balance, 0) - ?,
+                     wallet_balance = COALESCE(wallet_balance, 0) - ?,
+                     activePackage = ?, activePackageId = ?, planActivated = 'true'
+                 WHERE id = ? AND COALESCE(balance, 0) >= ?`,
+                [upgradeCost, upgradeCost, targetPackage.name, targetPackage.id, req.user.id, upgradeCost]
+            );
+            if (!userUpdate.changes) {
+                throw apiError(409, 'Your balance changed before the upgrade completed. Please refresh and try again.');
+            }
+
+            // The upgrade commits only the difference, so the referral bonus
+            // recorded for this cycle is also based on the difference.
+            const referralBonus = Math.round(upgradeCost * 0.5);
+            await dbRunAsync(
+                `INSERT INTO user_investments
+                 (user_id, username, package_id, package_name, capital, daily_rate, cycle_days,
+                  daily_earning, total_payout, referral_bonus, days_credited, status, activated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', datetime('now'))`,
+                [
+                    req.user.id,
+                    user.username,
+                    targetPackage.id,
+                    targetPackage.name,
+                    targetPackage.capital,
+                    targetPackage.daily_rate,
+                    targetPackage.cycle_days,
+                    targetPackage.daily_earning,
+                    targetPackage.total_payout,
+                    referralBonus
+                ]
+            );
+
+            if (user.referred_by) {
+                await dbRunAsync(
+                    `UPDATE users
+                     SET affiliate_balance = COALESCE(affiliate_balance, 0) + ?
+                     WHERE id != ? AND (
+                        LOWER(my_referral_id) = LOWER(?) OR LOWER(username) = LOWER(?)
+                     )`,
+                    [referralBonus, req.user.id, user.referred_by, user.referred_by]
+                );
+            }
+
+            return {
+                upgradeCost,
+                newBalance,
+                previousPackage: { id: current.package_id, name: current.package_name, capital: currentCapital }
+            };
+        }, 'upgrade_package');
+
+        console.warn(`[UPGRADE] ${req.user.username} upgraded to ${targetPackage.name} (cost ₦${result.upgradeCost})`);
+        return res.json({
             success: true,
-            message: `Successfully upgraded to ${targetPackage.name}. ₦${upgradeCost.toLocaleString()} was deducted from your wallet.`,
-            upgrade_cost: upgradeCost,
-            newBalance,
-            previous_package: { id: current.package_id, name: current.package_name, capital: current.capital },
+            message: `Successfully upgraded to ${targetPackage.name}. ₦${result.upgradeCost.toLocaleString()} was deducted from your wallet.`,
+            upgrade_cost: result.upgradeCost,
+            newBalance: result.newBalance,
+            previous_package: result.previousPackage,
             package: serializePackageForApi(targetPackage)
         });
     } catch (error) {
-        if (transactionOpen) {
-            try { await dbRunAsync('ROLLBACK'); } catch (_) {}
-        }
         console.error('Upgrade package error:', error.message);
-        res.status(500).json({ error: 'Failed to upgrade package. Please try again.' });
+        return sendApiError(res, error, 'Failed to upgrade package. Please try again.');
     }
 });
 
 // ==========================================
 // 4. WITHDRAWAL REQUESTS (User initiated)
 // ==========================================
-app.post('/api/request-withdrawal', authenticateToken, async (req, res) => {
+app.post('/api/request-withdrawal', authenticateToken, actionLimiter, async (req, res) => {
     try {
-        const { amount, wallet_type, bank_details } = req.body;
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const amount = toFiniteNumber(body.amount);
         const username = req.user.username;
+        const walletType = body.wallet_type || 'balance';
+        const walletColumns = {
+            balance: 'balance',
+            affiliate: 'affiliate_balance',
+            task: 'taskEarnings'
+        };
+        const walletField = walletColumns[walletType];
 
-        readSiteSetting('withdrawals_open', 'true', (settingErr, withdrawalsOpen) => {
-            if (settingErr) return res.status(500).json({ error: 'Failed to load site settings' });
-            if (withdrawalsOpen !== 'true') return res.status(403).json({ error: 'Withdrawals are currently disabled.' });
-            if (!amount || amount < 3000) {
-                return res.status(400).json({ error: 'Minimum withdrawal amount is ₦3,000' });
-            }
+        if (amount === null || amount < 3000) {
+            return res.status(400).json({ error: 'Minimum withdrawal amount is ₦3,000' });
+        }
+        if (!walletField) {
+            return res.status(400).json({ error: 'Invalid wallet type. Use balance, task or affiliate.' });
+        }
 
-            let walletField = '';
-            if (wallet_type === 'affiliate') walletField = 'affiliate_balance';
-            else if (wallet_type === 'task') walletField = 'taskEarnings';
-            else walletField = 'balance';
+        const withdrawalsOpen = await getSiteSetting('withdrawals_open', 'true');
+        if (!isTrueFlag(withdrawalsOpen)) {
+            return res.status(403).json({ error: 'Withdrawals are currently disabled.' });
+        }
 
-            db.get(`SELECT ${walletField} as balance FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
-                if (err || !user) return res.status(404).json({ error: 'User not found' });
-                if (user.balance < amount) return res.status(400).json({ error: 'Insufficient balance' });
+        const bankDetails = body.bank_details && typeof body.bank_details === 'object'
+            ? body.bank_details
+            : {};
+        const bankDetailsStr = JSON.stringify(bankDetails);
 
-                let updateSql, params;
-                if (walletField === 'balance') {
-                    updateSql = `UPDATE users SET balance = balance - ?, wallet_balance = wallet_balance - ? WHERE LOWER(username) = LOWER(?) AND balance >= ?`;
-                    params = [amount, amount, username, amount];
-                } else {
-                    updateSql = `UPDATE users SET ${walletField} = ${walletField} - ? WHERE LOWER(username) = LOWER(?) AND ${walletField} >= ?`;
-                    params = [amount, username, amount];
-                }
+        await withSqliteTransaction(async () => {
+            const existing = await dbGetAsync(
+                `SELECT id FROM withdrawals
+                 WHERE LOWER(username) = LOWER(?) AND status IN ('pending', 'processing')
+                 LIMIT 1`,
+                [username]
+            );
+            if (existing) throw apiError(409, 'You already have a withdrawal awaiting processing.');
 
-                db.run(updateSql, params, function(updateErr) {
-                        if (updateErr || this.changes === 0) return res.status(500).json({ error: 'Failed to process withdrawal' });
+            const user = await dbGetAsync(
+                `SELECT ${walletField} AS available_balance FROM users WHERE LOWER(username) = LOWER(?)`,
+                [username]
+            );
+            if (!user) throw apiError(404, 'User not found.');
+            const availableBalance = toFiniteNumber(user.available_balance) || 0;
+            if (availableBalance < amount) throw apiError(400, 'Insufficient balance.');
 
-                        const bankDetailsStr = JSON.stringify(bank_details || {});
-                        db.run(`INSERT INTO withdrawals (username, amount, wallet_type, status, bank_details, created_at)
-                                VALUES (?, ?, ?, 'pending', ?, datetime('now'))`,
-                            [username, amount, wallet_type, bankDetailsStr], function(err2) {
-                                if (err2) return res.status(500).json({ error: 'Failed to create withdrawal request' });
-                                res.json({ success: true, message: 'Withdrawal request submitted. Awaiting admin approval.' });
-                            });
-                    });
-            });
-        });
+            const updateSql = walletField === 'balance'
+                ? `UPDATE users
+                   SET balance = COALESCE(balance, 0) - ?,
+                       wallet_balance = COALESCE(wallet_balance, 0) - ?
+                   WHERE LOWER(username) = LOWER(?) AND COALESCE(balance, 0) >= ?`
+                : `UPDATE users
+                   SET ${walletField} = COALESCE(${walletField}, 0) - ?
+                   WHERE LOWER(username) = LOWER(?) AND COALESCE(${walletField}, 0) >= ?`;
+            const updateParams = walletField === 'balance'
+                ? [amount, amount, username, amount]
+                : [amount, username, amount];
+            const updateResult = await dbRunAsync(updateSql, updateParams);
+            if (!updateResult.changes) throw apiError(409, 'Your balance changed before the withdrawal was submitted. Please try again.');
+
+            await dbRunAsync(
+                `INSERT INTO withdrawals (username, amount, wallet_type, status, bank_details, created_at)
+                 VALUES (?, ?, ?, 'pending', ?, datetime('now'))`,
+                [username, amount, walletType, bankDetailsStr]
+            );
+        }, 'withdrawal_request');
+
+        return res.json({ success: true, message: 'Withdrawal request submitted. Awaiting admin approval.' });
     } catch (error) {
-        res.status(500).json({ error: 'Server error' });
+        console.error('Withdrawal request error:', error.message);
+        return sendApiError(res, error, 'Failed to process withdrawal. Please try again.');
     }
 });
 
 app.get('/api/admin/withdrawals', authenticateToken, adminOnly, (req, res) => {
-    const status = req.query.status || 'pending';
-    db.all(`SELECT id, username, amount, wallet_type, bank_details, status, admin_note, reviewed_by, created_at, reviewed_at 
-            FROM withdrawals WHERE status = ? ORDER BY created_at DESC`, [status], (err, rows) => {
+    const requestedStatus = String(req.query.status || 'pending').toLowerCase();
+    const allowedStatuses = ['pending', 'processing', 'declined', 'completed', 'all'];
+    const status = allowedStatuses.includes(requestedStatus) ? requestedStatus : 'pending';
+    const where = status === 'all' ? '' : 'WHERE status = ?';
+    const params = status === 'all' ? [] : [status];
+    db.all(`SELECT id, username, amount, wallet_type, bank_details, status, admin_note, reviewed_by, created_at, reviewed_at
+            FROM withdrawals ${where} ORDER BY created_at DESC`, params, (err, rows) => {
         if (err) return res.status(500).json({ error: "Database error" });
         res.json({ success: true, withdrawals: rows || [] });
     });
@@ -1671,7 +2085,8 @@ app.get('/api/admin/all-withdrawals', authenticateToken, adminOnly, (req, res) =
 });
 
 app.post('/api/admin/approve-withdrawal', authenticateToken, adminOnly, async (req, res) => {
-    const { id, note } = req.body;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { id, note } = body;
     if (!id) return res.status(400).json({ error: 'Withdrawal ID required' });
 
     try {
@@ -1689,39 +2104,60 @@ app.post('/api/admin/approve-withdrawal', authenticateToken, adminOnly, async (r
     }
 });
 
-app.post('/api/admin/decline-withdrawal', authenticateToken, adminOnly, (req, res) => {
-    const { id, note } = req.body;
+app.post('/api/admin/decline-withdrawal', authenticateToken, adminOnly, async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const id = body.id;
+    const note = body.note;
     if (!id) return res.status(400).json({ error: "Withdrawal ID required" });
-    db.get(`SELECT * FROM withdrawals WHERE id = ? AND status = 'pending'`, [id], (err, withdrawal) => {
-        if (err || !withdrawal) return res.status(404).json({ error: "Withdrawal not found or already processed" });
-        let walletField = '';
-        if (withdrawal.wallet_type === 'affiliate') walletField = 'affiliate_balance';
-        else if (withdrawal.wallet_type === 'task') walletField = 'taskEarnings';
-        else walletField = 'balance';
-        const updateSql = walletField === 'balance'
-            ? `UPDATE users SET balance = balance + ?, wallet_balance = wallet_balance + ? WHERE LOWER(username) = LOWER(?)`
-            : `UPDATE users SET ${walletField} = ${walletField} + ? WHERE LOWER(username) = LOWER(?)`;
-        const params = walletField === 'balance'
-            ? [withdrawal.amount, withdrawal.amount, withdrawal.username]
-            : [withdrawal.amount, withdrawal.username];
 
-        db.run(updateSql, params, function(refundErr) {
-            if (refundErr) return res.status(500).json({ error: "Failed to refund user" });
-            db.run(`UPDATE withdrawals SET status = 'declined', admin_note = ?, reviewed_by = ?, reviewed_at = datetime('now') 
-                    WHERE id = ? AND status = 'pending'`,
-                    [note || 'Your withdrawal was declined. Please contact support for assistance.', req.user.username, id], function(updateErr) {
-                if (updateErr) return res.status(500).json({ error: "Database error" });
-                if (this.changes === 0) return res.status(400).json({ error: "Withdrawal already processed" });
-                console.warn(`[ADMIN] Withdrawal ${id} declined by ${req.user.username}`);
-                res.json({ success: true, message: "Withdrawal declined and refunded!" });
-            });
-        });
-    });
+    try {
+        await withSqliteTransaction(async () => {
+            const withdrawal = await dbGetAsync(
+                `SELECT * FROM withdrawals WHERE id = ? AND status = 'pending'`,
+                [id]
+            );
+            if (!withdrawal) throw apiError(404, "Withdrawal not found or already processed");
+
+            const walletField = withdrawal.wallet_type === 'affiliate'
+                ? 'affiliate_balance'
+                : withdrawal.wallet_type === 'task' ? 'taskEarnings' : 'balance';
+            const amount = toFiniteNumber(withdrawal.amount);
+            if (amount === null || amount <= 0) throw new Error('Withdrawal contains an invalid amount.');
+
+            const updateSql = walletField === 'balance'
+                ? `UPDATE users
+                   SET balance = COALESCE(balance, 0) + ?,
+                       wallet_balance = COALESCE(wallet_balance, 0) + ?
+                   WHERE LOWER(username) = LOWER(?)`
+                : `UPDATE users
+                   SET ${walletField} = COALESCE(${walletField}, 0) + ?
+                   WHERE LOWER(username) = LOWER(?)`;
+            const params = walletField === 'balance'
+                ? [amount, amount, withdrawal.username]
+                : [amount, withdrawal.username];
+            const refundResult = await dbRunAsync(updateSql, params);
+            if (!refundResult.changes) throw apiError(404, 'Withdrawal user no longer exists.');
+
+            const updateResult = await dbRunAsync(
+                `UPDATE withdrawals
+                 SET status = 'declined', admin_note = ?, reviewed_by = ?, reviewed_at = datetime('now')
+                 WHERE id = ? AND status = 'pending'`,
+                [note || 'Your withdrawal was declined. Please contact support for assistance.', req.user.username, id]
+            );
+            if (!updateResult.changes) throw apiError(409, 'Withdrawal was already processed.');
+        }, 'decline_withdrawal');
+
+        console.warn(`[ADMIN] Withdrawal ${id} declined by ${req.user.username}`);
+        return res.json({ success: true, message: "Withdrawal declined and refunded!" });
+    } catch (error) {
+        console.error('Decline withdrawal error:', error.message);
+        return sendApiError(res, error, 'Unable to decline withdrawal.');
+    }
 });
 
 app.get('/api/user/withdrawals', authenticateToken, (req, res) => {
     const username = req.user.username;
-    db.all(`SELECT id, amount, wallet_type, status, admin_note, created_at, reviewed_at 
+    db.all(`SELECT id, amount, wallet_type, status, admin_note, created_at, reviewed_at
             FROM withdrawals WHERE username = ? ORDER BY created_at DESC`, [username], (err, rows) => {
         if (err) return res.status(500).json({ error: "Database error" });
         res.json({ success: true, withdrawals: rows || [] });
@@ -1730,11 +2166,37 @@ app.get('/api/user/withdrawals', authenticateToken, (req, res) => {
 
 app.get('/api/user/pending-withdrawal', authenticateToken, (req, res) => {
     const username = req.user.username;
-    db.get(`SELECT id FROM withdrawals WHERE username = ? AND status = 'pending' LIMIT 1`, [username], (err, row) => {
+    db.get(`SELECT id, status FROM withdrawals
+            WHERE LOWER(username) = LOWER(?) AND status IN ('pending', 'processing')
+            LIMIT 1`, [username], (err, row) => {
         if (err) return res.status(500).json({ error: "Database error" });
-        res.json({ success: true, hasPending: !!row });
+        res.json({ success: true, hasPending: !!row, status: row ? row.status : null });
     });
 });
+
+// Keep this single-segment fallback route after the more specific /api/user/*
+// routes above; otherwise Express would treat /withdrawals and
+// /pending-withdrawal as usernames.
+app.get('/api/user/:username', authenticateToken, async (req, res) => {
+    const requestedUsername = String(req.params.username || '').trim();
+    if (req.user.role !== 'admin' && String(req.user.username).toLowerCase() !== requestedUsername.toLowerCase()) {
+        return res.status(403).json({ error: "Unauthorized access to another user's profile" });
+    }
+    try {
+        const user = await dbGetAsync(
+            `SELECT id, username, balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance,
+                    my_referral_id, referred_by, planActivated, activePackage, activePackageId, role,
+                    full_name, phone, bank_name, bank_account_number, bank_account_holder, created_at
+             FROM users WHERE LOWER(username) = LOWER(?)`,
+            [requestedUsername]
+        );
+        if (!user) return res.status(404).json({ error: "User not found" });
+        return res.json({ success: true, user: serializeUser(user) });
+    } catch (error) {
+        return sendApiError(res, error, 'Unable to load user profile.');
+    }
+});
+
 
 // ==========================================
 // 5. DEPOSIT REQUESTS (User initiated) — MANUAL PAYMENTS
@@ -1825,13 +2287,20 @@ async function handleDepositRequest(req, res) {
 
         // For multipart requests, text fields land in req.body (already parsed
         // by multer). Coerce defensively for both content types.
-        const amount = req.body ? req.body.amount : undefined;
-        const payment_method = req.body ? req.body.payment_method : undefined;
-        const transaction_ref = req.body ? req.body.transaction_ref : undefined;
-        const sender_name = req.body ? req.body.sender_name : undefined;
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const amount = toFiniteNumber(body.amount);
+        const paymentMethod = typeof body.payment_method === 'string'
+            ? body.payment_method.trim().slice(0, 100)
+            : 'bank_transfer';
+        const transactionReference = typeof body.transaction_ref === 'string'
+            ? body.transaction_ref.trim().slice(0, 150)
+            : '';
+        const senderName = typeof body.sender_name === 'string'
+            ? body.sender_name.trim().slice(0, 150)
+            : '';
         const username = req.user.username;
 
-        if (!amount || !isValidAmount(amount) || amount < 1000) {
+        if (amount === null || amount < 1000) {
             return res.status(400).json({ error: "Minimum deposit amount is ₦1,000" });
         }
 
@@ -1844,48 +2313,64 @@ async function handleDepositRequest(req, res) {
         const receiptData = resolved.data;
         const receiptMime = resolved.mime;
 
-        const userRow = await dbGetAsync(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [username]);
-
-        // Idempotency guard: if the client retries with the same transaction
-        // reference (common after a timeout), don't create a duplicate deposit.
-        if (transaction_ref) {
-            const existing = await dbGetAsync(
-                `SELECT id FROM deposits WHERE username = ? AND transaction_ref = ? AND status = 'pending' LIMIT 1`,
-                [username, transaction_ref]
+        await withSqliteTransaction(async () => {
+            const userRow = await dbGetAsync(
+                `SELECT id FROM users WHERE LOWER(username) = LOWER(?)`,
+                [username]
             );
-            if (existing) {
-                return res.json({
-                    success: true,
-                    message: "This deposit request was already submitted and is awaiting admin approval."
-                });
-            }
-        }
+            if (!userRow) throw apiError(404, 'User no longer exists.');
 
-        await withSqliteBusyRetry(
-            () => dbRunAsync(
+            // Idempotency guard: the transaction and insert are in the same
+            // transaction so two retries cannot both pass the check.
+            if (transactionReference) {
+                const existing = await dbGetAsync(
+                    `SELECT id, status FROM deposits
+                     WHERE LOWER(username) = LOWER(?) AND transaction_ref = ?
+                     LIMIT 1`,
+                    [username, transactionReference]
+                );
+                if (existing) {
+                    if (existing.status === 'pending') {
+                        throw apiError(
+                            409,
+                            "This deposit request was already submitted and is awaiting admin approval.",
+                            'DEPOSIT_ALREADY_PENDING'
+                        );
+                    }
+                    throw apiError(409, "This transaction reference has already been processed.", 'DEPOSIT_ALREADY_PROCESSED');
+                }
+            }
+
+            await dbRunAsync(
                 `INSERT INTO deposits (username, user_id, amount, sender_name, status, payment_method, transaction_ref, receipt, receipt_mime)
                  VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
                 [
                     username,
-                    userRow ? userRow.id : null,
-                    parseFloat(amount),
-                    sender_name || username,
-                    payment_method || 'bank_transfer',
-                    transaction_ref || null,
+                    userRow.id,
+                    amount,
+                    senderName || username,
+                    paymentMethod || 'bank_transfer',
+                    transactionReference || null,
                     receiptData,
                     receiptMime
                 ]
-            ),
-            'deposit_insert'
-        );
+            );
+        }, 'deposit_insert');
 
         res.json({
             success: true,
             message: "Deposit request submitted. Your receipt has been uploaded and is awaiting admin approval."
         });
     } catch (error) {
+        if (error?.code === 'DEPOSIT_ALREADY_PENDING') {
+            return res.json({
+                success: true,
+                already_submitted: true,
+                message: error.message
+            });
+        }
         console.error('Deposit request error:', error.message);
-        res.status(500).json({ error: "Server error. Please try again." });
+        return sendApiError(res, error, "Server error. Please try again.");
     }
 }
 
@@ -1899,8 +2384,8 @@ app.post('/api/request-deposit/upload', authenticateToken, actionLimiter, upload
 app.post('/api/request-deposit', authenticateToken, actionLimiter, handleDepositRequest);
 
 // User: their own deposit history.
-// NOTE: uses /api/my-deposits (not /api/user/deposits) to avoid being captured
-// by the GET /api/user/:username route which is registered earlier.
+// Uses /api/my-deposits so the path remains explicit and cannot be confused
+// with a single-segment user profile route.
 app.get('/api/my-deposits', authenticateToken, async (req, res) => {
     const username = req.user.username;
     try {
@@ -1931,7 +2416,7 @@ app.get('/api/user/deposit/:id/receipt', authenticateToken, async (req, res) => 
     try {
         const deposit = await dbGetAsync(`SELECT * FROM deposits WHERE id = ?`, [req.params.id]);
         if (!deposit) return res.status(404).json({ error: "Deposit not found." });
-        if (deposit.username.toLowerCase() !== req.user.username.toLowerCase() && req.user.role !== 'admin') {
+        if (String(deposit.username || '').toLowerCase() !== String(req.user.username || '').toLowerCase() && req.user.role !== 'admin') {
             return res.status(403).json({ error: "Unauthorized." });
         }
         if (!deposit.receipt) return res.status(404).json({ error: "No receipt uploaded for this deposit." });
@@ -1988,49 +2473,60 @@ app.get('/api/admin/deposit/:id/receipt', authenticateToken, adminOnly, async (r
 
 // Admin: approve a pending manual deposit (credits the user's balance).
 app.post('/api/admin/approve-deposit', authenticateToken, adminOnly, async (req, res) => {
-    const { depositId } = req.body;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const depositId = body.depositId;
     if (!depositId) return res.status(400).json({ error: "Deposit ID required" });
+
     try {
-        const deposit = await dbGetAsync(`SELECT * FROM deposits WHERE id = ?`, [depositId]);
-        if (!deposit) return res.status(404).json({ error: "Deposit not found." });
+        const deposit = await withSqliteTransaction(async () => {
+            const pendingDeposit = await dbGetAsync(
+                `SELECT * FROM deposits WHERE id = ? AND status = 'pending'`,
+                [depositId]
+            );
+            if (!pendingDeposit) throw apiError(409, "Deposit already processed or not pending.");
+            const amount = toFiniteNumber(pendingDeposit.amount);
+            if (amount === null || amount <= 0) throw new Error('Deposit contains an invalid amount.');
 
-        const updateResult = await dbRunAsync(
-            `UPDATE deposits SET status = 'approved', reviewed_by = ?, reviewed_at = datetime('now')
-             WHERE id = ? AND status = 'pending'`,
-            [req.user.username, deposit.id]
-        );
-        if (updateResult.changes === 0) {
-            return res.status(400).json({ error: "Deposit already processed or not pending." });
-        }
+            const creditResult = await dbRunAsync(
+                `UPDATE users SET
+                    balance = COALESCE(balance, 0) + ?,
+                    wallet_balance = COALESCE(wallet_balance, 0) + ?
+                 WHERE LOWER(username) = LOWER(?)`,
+                [amount, amount, pendingDeposit.username]
+            );
+            if (!creditResult.changes) throw apiError(404, "Deposit user no longer exists.");
 
-        const creditResult = await dbRunAsync(
-            `UPDATE users SET 
-                balance = COALESCE(balance, 0) + ?,
-                wallet_balance = COALESCE(wallet_balance, 0) + ?
-             WHERE LOWER(username) = LOWER(?)`,
-            [deposit.amount, deposit.amount, deposit.username]
-        );
-        if (!creditResult.changes) {
-            // User not found — revert the status so the deposit stays pending.
-            await dbRunAsync(`UPDATE deposits SET status = 'pending', reviewed_by = NULL, reviewed_at = NULL WHERE id = ?`, [deposit.id]);
-            return res.status(400).json({ error: "Deposit user no longer exists." });
-        }
+            const updateResult = await dbRunAsync(
+                `UPDATE deposits
+                 SET status = 'approved', reviewed_by = ?, reviewed_at = datetime('now')
+                 WHERE id = ? AND status = 'pending'`,
+                [req.user.username, pendingDeposit.id]
+            );
+            if (!updateResult.changes) throw apiError(409, "Deposit was already processed.");
+            return { ...pendingDeposit, amount };
+        }, 'approve_deposit');
 
         try {
-            await recordAdminAction(req.user.username, deposit.username, 'deposit_approve', { depositId: deposit.id, amount: deposit.amount });
-        } catch (e) { /* non-blocking */ }
+            await recordAdminAction(req.user.username, deposit.username, 'deposit_approve', {
+                depositId: deposit.id,
+                amount: deposit.amount
+            });
+        } catch (error) {
+            console.warn('Deposit audit log failed:', error.message);
+        }
 
         console.warn(`[ADMIN] Deposit ${deposit.id} approved by ${req.user.username}`);
-        res.json({ success: true, message: `Deposit of ₦${deposit.amount} approved and credited to ${deposit.username}` });
+        return res.json({ success: true, message: `Deposit of ₦${deposit.amount} approved and credited to ${deposit.username}` });
     } catch (error) {
         console.error('Approve deposit error:', error.message);
-        res.status(500).json({ error: "Failed to approve deposit." });
+        return sendApiError(res, error, "Failed to approve deposit.");
     }
 });
 
 // Admin: decline a pending manual deposit.
 app.post('/api/admin/decline-deposit', authenticateToken, adminOnly, async (req, res) => {
-    const { depositId, note } = req.body;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { depositId, note } = body;
     if (!depositId) return res.status(400).json({ error: "Deposit ID required" });
     try {
         const result = await dbRunAsync(
@@ -2050,59 +2546,61 @@ app.post('/api/admin/decline-deposit', authenticateToken, adminOnly, async (req,
 // ==========================================
 // 6. DAILY TASK CLAIM
 // ==========================================
-app.post('/api/claim-daily-task', authenticateToken, async (req, res) => {
+app.post('/api/claim-daily-task', authenticateToken, actionLimiter, async (req, res) => {
+    const userId = req.user.id;
+    const username = req.user.username;
+    const claimDate = getClaimDate();
+
     try {
-        const userId = req.user.id;
-        const username = req.user.username;
-
-        const user = await dbGetAsync(
-            `SELECT id, username, taskEarnings, planActivated, activePackage, activePackageId
-             FROM users WHERE id = ?`,
-            [userId]
-        );
-        if (!user) return res.status(404).json({ error: "User not found" });
-        if (user.planActivated !== 'true') {
-            return res.status(403).json({ error: "You must activate a plan first" });
-        }
-
-        // Determine the claim amount. Prefer the active investment's snapshotted
-        // daily_earning (authoritative), then the amount the client sends. This
-        // avoids zero/incorrect claims when old clients send a stale amount.
-        let amount = Number(req.body && req.body.amount);
         const activeInvestment = await dbGetAsync(
-            `SELECT daily_earning FROM user_investments WHERE user_id = ? AND status = 'active' ORDER BY activated_at DESC LIMIT 1`,
+            `SELECT daily_earning
+             FROM user_investments
+             WHERE user_id = ? AND status = 'active'
+             ORDER BY activated_at DESC LIMIT 1`,
             [userId]
         );
-        if (activeInvestment && activeInvestment.daily_earning > 0) {
-            amount = Number(activeInvestment.daily_earning);
-        }
-        if (!amount || amount <= 0) {
-            return res.status(400).json({ error: "Invalid claim amount. Please activate a valid package." });
+        const amount = activeInvestment ? toFiniteNumber(activeInvestment.daily_earning) : null;
+        if (amount === null || amount <= 0) {
+            return res.status(403).json({ error: "You must activate a valid package first." });
         }
 
-        // Idempotent daily claim keyed by both user id and username.
-        const today = new Date().toISOString().split('T')[0];
-        const existing = await dbGetAsync(
-            `SELECT id, amount FROM daily_claims WHERE (username = ? OR username = ?) AND claim_date = ? LIMIT 1`,
-            [username, user.username, today]
-        );
-        if (existing) {
-            return res.status(400).json({
-                error: "You have already claimed your daily earnings today. Come back tomorrow!",
-                already_claimed: true,
-                claimed_amount: Number(existing.amount || 0)
-            });
-        }
+        const result = await withSqliteTransaction(async () => {
+            const user = await dbGetAsync(
+                `SELECT id, username, taskEarnings, planActivated
+                 FROM users WHERE id = ?`,
+                [userId]
+            );
+            if (!user) throw apiError(404, 'User not found.');
+            if (!isTrueFlag(user.planActivated)) throw apiError(403, 'You must activate a plan first.');
 
-        const newTaskEarnings = (Number(user.taskEarnings) || 0) + amount;
-        await dbRunAsync(
-            `UPDATE users SET taskEarnings = ? WHERE id = ?`,
-            [newTaskEarnings, userId]
-        );
-        await dbRunAsync(
-            `INSERT INTO daily_claims (username, claim_date, amount) VALUES (?, ?, ?)`,
-            [username, today, amount]
-        );
+            const existing = await dbGetAsync(
+                `SELECT id, amount FROM daily_claims
+                 WHERE LOWER(username) = LOWER(?) AND claim_date = ?
+                 LIMIT 1`,
+                [username, claimDate]
+            );
+            if (existing) {
+                const duplicate = apiError(
+                    400,
+                    "You have already claimed your daily earnings today. Come back tomorrow!",
+                    'ALREADY_CLAIMED'
+                );
+                duplicate.claimedAmount = Number(existing.amount || 0);
+                throw duplicate;
+            }
+
+            const currentTaskEarnings = toFiniteNumber(user.taskEarnings) || 0;
+            const newTaskEarnings = currentTaskEarnings + amount;
+            await dbRunAsync(
+                `INSERT INTO daily_claims (username, claim_date, amount) VALUES (?, ?, ?)`,
+                [username, claimDate, amount]
+            );
+            await dbRunAsync(
+                `UPDATE users SET taskEarnings = ? WHERE id = ?`,
+                [newTaskEarnings, userId]
+            );
+            return { newTaskEarnings };
+        }, 'daily_claim');
 
         const refreshed = await dbGetAsync(
             `SELECT balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance
@@ -2110,11 +2608,11 @@ app.post('/api/claim-daily-task', authenticateToken, async (req, res) => {
             [userId]
         );
 
-        res.json({
+        return res.json({
             success: true,
             message: `Successfully claimed ₦${amount.toLocaleString()}!`,
             claimed_amount: amount,
-            newBalance: newTaskEarnings,
+            newBalance: result.newTaskEarnings,
             balances: refreshed ? {
                 balance: Number(refreshed.balance ?? 0),
                 wallet_balance: Number(refreshed.wallet_balance ?? 0),
@@ -2124,8 +2622,21 @@ app.post('/api/claim-daily-task', authenticateToken, async (req, res) => {
             } : null
         });
     } catch (error) {
+        if (error?.code === 'ALREADY_CLAIMED') {
+            return res.status(400).json({
+                error: error.message,
+                already_claimed: true,
+                claimed_amount: error.claimedAmount || 0
+            });
+        }
+        if (String(error?.message || '').includes('UNIQUE constraint failed') && String(error?.message || '').includes('daily_claims')) {
+            return res.status(400).json({
+                error: "You have already claimed your daily earnings today. Come back tomorrow!",
+                already_claimed: true
+            });
+        }
         console.error('Claim daily task error:', error.message);
-        res.status(500).json({ error: "Server error" });
+        return sendApiError(res, error, 'Unable to claim daily earnings. Please try again.');
     }
 });
 
@@ -2133,28 +2644,47 @@ app.post('/api/claim-daily-task', authenticateToken, async (req, res) => {
 // 7. LIVE CHAT / CUSTOMER SUPPORT API
 // ==========================================
 app.get('/api/chat/history/:username', authenticateToken, (req, res) => {
-    if (req.user.role !== 'admin' && req.user.role !== 'support' && req.user.username.toLowerCase() !== req.params.username.toLowerCase()) {
+    const requestedUsername = String(req.params.username || '').trim();
+    const ownUsername = String(req.user.username || '').trim();
+    if (req.user.role !== 'admin' && req.user.role !== 'support' && ownUsername.toLowerCase() !== requestedUsername.toLowerCase()) {
         return res.status(403).json({ error: "Unauthorized access" });
     }
-    db.all(`SELECT * FROM messages WHERE user_id = ? ORDER BY id ASC`, [req.params.username], (err, rows) => {
+    db.all(`SELECT * FROM messages WHERE LOWER(user_id) = LOWER(?) ORDER BY id ASC`, [requestedUsername], (err, rows) => {
         if (err) return res.status(500).json({ error: "Failed to load messages" });
         res.json({ success: true, messages: rows || [] });
     });
 });
 
-app.post('/api/chat/send', authenticateToken, actionLimiter, (req, res) => {
-    const { user_id, message } = req.body;
-    const sender = req.user.username;
-    if (!message || message.trim() === '') return res.status(400).json({ error: "Message cannot be empty" });
-    const targetUserId = user_id || sender;
-    db.run(`INSERT INTO messages (user_id, sender, message) VALUES (?, ?, ?)`, [targetUserId, sender, message.trim()], function (err) {
-        if (err) return res.status(500).json({ error: "Failed to save message" });
-        res.json({ success: true, message: "Message sent" });
-    });
+app.post('/api/chat/send', authenticateToken, actionLimiter, async (req, res) => {
+    try {
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const sender = req.user.username;
+        const message = typeof body.message === 'string' ? body.message.trim() : '';
+        if (!message) return res.status(400).json({ error: "Message cannot be empty" });
+        if (message.length > 5000) return res.status(400).json({ error: "Message is too long. Maximum length is 5,000 characters." });
+
+        const requestedTarget = body.user_id === undefined || body.user_id === null
+            ? sender
+            : String(body.user_id).trim();
+        const privileged = req.user.role === 'admin' || req.user.role === 'support';
+        if (!privileged && requestedTarget.toLowerCase() !== sender.toLowerCase()) {
+            return res.status(403).json({ error: "You can only send messages to your own support conversation." });
+        }
+
+        await dbRunAsync(
+            `INSERT INTO messages (user_id, sender, message) VALUES (?, ?, ?)`,
+            [requestedTarget || sender, sender, message]
+        );
+        return res.json({ success: true, message: "Message sent" });
+    } catch (error) {
+        console.error('Chat send error:', error.message);
+        return sendApiError(res, error, 'Failed to save message.');
+    }
 });
 
 app.get('/api/support/users', authenticateToken, adminOnly, (req, res) => {
     db.all(`SELECT DISTINCT user_id FROM messages`, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: "Failed to load support users" });
         res.json({ success: true, users: rows || [] });
     });
 });
@@ -2173,20 +2703,19 @@ app.post('/api/chat/welcome', authenticateToken, async (req, res) => {
     try {
         const username = req.user.username;
         const welcomeMessage = "👋 Hello! I'm an Access Wealth support agent. How may I help you today?";
-        db.get(`SELECT id FROM messages WHERE user_id = ? LIMIT 1`, [username], (err, existing) => {
-            if (err) return res.status(500).json({ error: "Database error" });
-            if (!existing) {
-                db.run(`INSERT INTO messages (user_id, sender, message) VALUES (?, 'support', ?)`,
-                    [username, welcomeMessage], function(insertErr) {
-                    if (insertErr) return res.status(500).json({ error: "Failed to send welcome" });
-                    res.json({ success: true, message: "Welcome message sent" });
-                });
-            } else {
-                res.json({ success: true, message: "Already has messages" });
-            }
-        });
+        const existing = await dbGetAsync(
+            `SELECT id FROM messages WHERE LOWER(user_id) = LOWER(?) LIMIT 1`,
+            [username]
+        );
+        if (existing) return res.json({ success: true, message: "Already has messages" });
+        await dbRunAsync(
+            `INSERT INTO messages (user_id, sender, message) VALUES (?, 'support', ?)`,
+            [username, welcomeMessage]
+        );
+        return res.json({ success: true, message: "Welcome message sent" });
     } catch (error) {
-        res.status(500).json({ error: "Server error" });
+        console.error('Chat welcome error:', error.message);
+        return sendApiError(res, error, "Failed to send welcome message.");
     }
 });
 
@@ -2214,9 +2743,12 @@ async function recordAdminAction(adminUsername, targetUsername, action, details 
 
 app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, res) => {
     try {
-        const { username, amount, walletType, action } = req.body;
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const username = typeof body.username === 'string' ? body.username.trim() : '';
+        const walletType = body.walletType;
+        const action = body.action;
         const column = getAdminWalletColumn(walletType);
-        const numericAmount = Number(amount);
+        const numericAmount = toFiniteNumber(body.amount);
         if (!username || !isValidAmount(numericAmount) || !column) {
             return res.status(400).json({ error: "Username and valid amount required" });
         }
@@ -2237,14 +2769,13 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
 
         const result = await dbRunAsync(updateSql, finalParams);
         if (!result.changes) return res.status(400).json({ error: action === 'subtract' ? 'User not found or wallet has insufficient balance.' : 'User not found.' });
-        await recordAdminAction(req.user.username, username, `wallet_${action}`, { wallet: column, amount: numericAmount });
-        return res.json({ success: true, message: `Wallet updated successfully.` });
-        db.run(query, [parseFloat(amount), username], function(err) {
-            if (err) return res.status(500).json({ error: "Database error." });
-            if (this.changes === 0) return res.status(400).json({ error: "User not found" });
-            console.warn(`[ADMIN] ${action === 'subtract' ? 'Subtracted' : 'Added'} ₦${amount} to ${username}'s ${walletType || 'balance'} by ${req.user.username}`);
-            res.json({ success: true, message: `Successfully ${action === 'subtract' ? 'subtracted' : 'added'} ₦${amount} to ${username}'s wallet!` });
-        });
+        try {
+            await recordAdminAction(req.user.username, username, `wallet_${action}`, { wallet: column, amount: numericAmount });
+        } catch (auditError) {
+            console.warn('Wallet adjustment audit log failed:', auditError.message);
+        }
+        console.warn(`[ADMIN] ${action === 'subtract' ? 'Subtracted' : 'Added'} ₦${numericAmount} to ${username}'s ${column} by ${req.user.username}`);
+        return res.json({ success: true, message: `Successfully ${action === 'subtract' ? 'subtracted' : 'added'} ₦${numericAmount} to ${username}'s wallet!` });
     } catch (error) {
         console.error("Adjust balance error:", error);
         res.status(500).json({ error: "Server error: " + error.message });
@@ -2255,8 +2786,10 @@ app.post('/api/admin/adjust-balance', authenticateToken, adminOnly, async (req, 
 // 'daily_earnings', 'affiliate_balance'. Returns the updated balance.
 app.post('/api/admin/manual-credit', authenticateToken, adminOnly, async (req, res) => {
     try {
-        const { username, amount, walletType } = req.body;
-        const numericAmount = Number(amount);
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const username = typeof body.username === 'string' ? body.username.trim() : '';
+        const walletType = body.walletType;
+        const numericAmount = toFiniteNumber(body.amount);
 
         if (!username || !isValidAmount(numericAmount)) {
             return res.status(400).json({ error: "Username and valid amount required" });
@@ -2288,7 +2821,11 @@ app.post('/api/admin/manual-credit', authenticateToken, adminOnly, async (req, r
             return res.status(400).json({ error: "User not found" });
         }
 
-        await recordAdminAction(req.user.username, username, 'manual_credit', { wallet: walletColumn, amount: numericAmount });
+        try {
+            await recordAdminAction(req.user.username, username, 'manual_credit', { wallet: walletColumn, amount: numericAmount });
+        } catch (auditError) {
+            console.warn('Manual credit audit log failed:', auditError.message);
+        }
 
         const updated = await dbGetAsync(
             `SELECT balance, taskEarnings, daily_earnings, affiliate_balance FROM users WHERE LOWER(username) = LOWER(?)`,
@@ -2308,8 +2845,9 @@ app.post('/api/admin/manual-credit', authenticateToken, adminOnly, async (req, r
 });
 
 app.post('/api/admin/change-user-plan', authenticateToken, adminOnly, async (req, res) => {
-    const username = (req.body.username || '').trim();
-    const packageId = (req.body.packageId || '').trim().toLowerCase();
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const username = typeof body.username === 'string' ? body.username.trim() : '';
+    const packageId = typeof body.packageId === 'string' ? body.packageId.trim().toLowerCase() : '';
     const selectedPackage = PACKAGE_BY_ID[packageId];
     if (!username || !selectedPackage) return res.status(400).json({ error: 'A valid username and package are required.' });
 
@@ -2351,8 +2889,9 @@ app.post('/api/admin/change-user-plan', authenticateToken, adminOnly, async (req
 });
 
 app.post('/api/admin/clear-total-balance', authenticateToken, adminOnly, async (req, res) => {
-    const username = (req.body.username || '').trim();
-    const confirmation = (req.body.confirmation || '').trim();
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const username = typeof body.username === 'string' ? body.username.trim() : '';
+    const confirmation = typeof body.confirmation === 'string' ? body.confirmation.trim() : '';
     if (!username || confirmation !== `CLEAR ${username}`) {
         return res.status(400).json({ error: 'Confirmation must exactly match CLEAR followed by the username.' });
     }
@@ -2369,7 +2908,11 @@ app.post('/api/admin/clear-total-balance', authenticateToken, adminOnly, async (
             `UPDATE users SET balance = 0, wallet_balance = 0, taskEarnings = 0, daily_earnings = 0, affiliate_balance = 0 WHERE id = ?`,
             [user.id]
         );
-        await recordAdminAction(req.user.username, user.username, 'clear_total_balance', { totalCleared });
+        try {
+            await recordAdminAction(req.user.username, user.username, 'clear_total_balance', { totalCleared });
+        } catch (auditError) {
+            console.warn('Clear balance audit log failed:', auditError.message);
+        }
         res.json({ success: true, message: `Cleared ₦${totalCleared.toLocaleString()} across all liquid wallet balances for ${user.username}. Active plans were not changed.`, totalCleared });
     } catch (error) {
         console.error('Clear total balance failed:', error.message);
@@ -2394,49 +2937,84 @@ app.get('/api/site-settings', authenticateToken, (req, res) => {
 
 app.post('/api/admin/settings', authenticateToken, adminOnly, async (req, res) => {
     try {
-        const updates = req.body || {};
-        const entries = Object.entries(updates);
-        if (!entries.length) return res.status(400).json({ error: "No settings provided" });
-        const done = [];
-        entries.forEach(([key, value]) => {
-            done.push(new Promise((resolve) => {
-                db.run(`INSERT INTO site_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [key, String(value)], (err) => resolve(err));
-            }));
-        });
-        Promise.all(done).then((results) => {
-            const error = results.find(Boolean);
-            if (error) return res.status(500).json({ error: "Failed to save settings" });
-            res.json({ success: true, message: "Settings updated successfully" });
-        });
+        const updates = req.body && typeof req.body === 'object' ? req.body : {};
+        const allowedSettings = new Set([
+            'maintenance_mode',
+            'registrations_open',
+            'deposits_open',
+            'withdrawals_open',
+            'sponsored_posts_open'
+        ]);
+        const entries = Object.entries(updates)
+            .filter(([key]) => allowedSettings.has(key));
+        if (!entries.length) return res.status(400).json({ error: "No valid settings provided" });
+
+        await withSqliteTransaction(async () => {
+            for (const [key, value] of entries) {
+                const normalizedValue = String(value).toLowerCase();
+                if (!['true', 'false'].includes(normalizedValue)) {
+                    throw apiError(400, `${key} must be true or false.`);
+                }
+                await dbRunAsync(
+                    `INSERT INTO site_settings (key, value) VALUES (?, ?)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+                    [key, normalizedValue]
+                );
+            }
+        }, 'admin_settings');
+        return res.json({ success: true, message: "Settings updated successfully" });
     } catch (error) {
-        res.status(500).json({ error: "Server error" });
+        return sendApiError(res, error, "Failed to save settings.");
     }
 });
 
-app.post('/api/admin/toggle-user-status', authenticateToken, adminOnly, (req, res) => {
-    const { username, status } = req.body;
-    if (!username || !status) return res.status(400).json({ error: "Username and status are required" });
-    db.run(`UPDATE users SET status = ? WHERE LOWER(username) = LOWER(?)`, [status, username], function(err) {
-        if (err) return res.status(500).json({ error: "Database error" });
-        if (this.changes === 0) return res.status(404).json({ error: "User not found" });
-        res.json({ success: true, message: `User ${username} is now ${status}` });
-    });
+app.post('/api/admin/toggle-user-status', authenticateToken, adminOnly, async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const username = typeof body.username === 'string' ? body.username.trim() : '';
+    const status = typeof body.status === 'string' ? body.status.trim().toLowerCase() : '';
+    if (!username || !['active', 'banned'].includes(status)) {
+        return res.status(400).json({ error: "Username and status must be provided. Status must be active or banned." });
+    }
+    if (username.toLowerCase() === String(req.user.username).toLowerCase()) {
+        return res.status(400).json({ error: "You cannot change your own admin status." });
+    }
+    try {
+        const result = await dbRunAsync(
+            `UPDATE users SET status = ? WHERE LOWER(username) = LOWER(?) AND role != 'admin'`,
+            [status, username]
+        );
+        if (!result.changes) return res.status(404).json({ error: "User not found or is an admin" });
+        return res.json({ success: true, message: `User ${username} is now ${status}` });
+    } catch (error) {
+        return sendApiError(res, error, 'Unable to update user status.');
+    }
 });
 
-app.get('/api/admin/stats', authenticateToken, adminOnly, (req, res) => {
-    const stats = { totalUsers: 0, activePlans: 0, revenue: 0, pendingDeposits: 0, pendingWithdrawals: 0 };
-    db.get("SELECT COUNT(*) as count FROM users", [], (err, row) => { if (row) stats.totalUsers = row.count;
-        db.get("SELECT COUNT(*) as count FROM users WHERE planActivated = 'true'", [], (err, row) => { if (row) stats.activePlans = row.count;
-            const revenueQuery = `SELECT (SELECT COALESCE(SUM(amount), 0) FROM deposits WHERE status = 'approved') + (SELECT COALESCE(SUM(amount), 0) FROM squad_transactions WHERE status = 'success') AS total`;
-            db.get(revenueQuery, [], (err, row) => { if (row && row.total) stats.revenue = row.total;
-                db.get("SELECT COUNT(*) as count FROM deposits WHERE status = 'pending'", [], (err, row) => { if (row) stats.pendingDeposits = row.count;
-                    db.get("SELECT COUNT(*) as count FROM withdrawals WHERE status = 'pending'", [], (err, row) => { if (row) stats.pendingWithdrawals = row.count;
-                        res.json({ success: true, stats });
-                    });
-                });
-            });
+app.get('/api/admin/stats', authenticateToken, adminOnly, async (req, res) => {
+    try {
+        const [users, activePlans, revenue, pendingDeposits, pendingWithdrawals] = await Promise.all([
+            dbGetAsync("SELECT COUNT(*) AS count FROM users"),
+            dbGetAsync("SELECT COUNT(*) AS count FROM users WHERE LOWER(CAST(planActivated AS TEXT)) IN ('true', '1')"),
+            dbGetAsync(`SELECT
+                (SELECT COALESCE(SUM(amount), 0) FROM deposits WHERE status = 'approved')
+                + (SELECT COALESCE(SUM(amount), 0) FROM squad_transactions WHERE status = 'success') AS total`),
+            dbGetAsync("SELECT COUNT(*) AS count FROM deposits WHERE status = 'pending'"),
+            dbGetAsync("SELECT COUNT(*) AS count FROM withdrawals WHERE status IN ('pending', 'processing')")
+        ]);
+        return res.json({
+            success: true,
+            stats: {
+                totalUsers: Number(users?.count || 0),
+                activePlans: Number(activePlans?.count || 0),
+                revenue: Number(revenue?.total || 0),
+                pendingDeposits: Number(pendingDeposits?.count || 0),
+                pendingWithdrawals: Number(pendingWithdrawals?.count || 0)
+            }
         });
-    });
+    } catch (error) {
+        console.error('Admin stats error:', error.message);
+        return sendApiError(res, error, 'Unable to load admin statistics.');
+    }
 });
 
 app.get('/api/admin/migrations/legacy-plans/status', authenticateToken, adminOnly, async (req, res) => {
@@ -2634,28 +3212,38 @@ app.post('/api/admin/migrations/legacy-plans/run', authenticateToken, adminOnly,
 // ==========================================
 // 9. REFERRAL SYSTEM ENDPOINTS
 // ==========================================
-app.get('/api/referral/stats/:username', authenticateToken, (req, res) => {
-    const username = req.params.username;
-    db.get(`SELECT my_referral_id, affiliate_balance FROM users WHERE LOWER(username) = LOWER(?)`, [username], (err, user) => {
-        if (err || !user) return res.status(404).json({ error: "User not found" });
-        const myRefId = user.my_referral_id;
-        db.get(`SELECT COUNT(*) as count FROM users WHERE referred_by = ?`, [myRefId], (err2, stats) => {
-            if (err2) return res.status(500).json({ error: "Database error" });
-            db.all(`SELECT username, created_at, planActivated FROM users WHERE referred_by = ? ORDER BY created_at DESC`, [myRefId], (err3, referrals) => {
-                res.json({
-                    success: true,
-                    totalReferrals: stats.count || 0,
-                    earnings: user.affiliate_balance || 0,
-                    referrals: referrals || []
-                });
-            });
+app.get('/api/referral/stats/:username', authenticateToken, async (req, res) => {
+    const username = String(req.params.username || '').trim();
+    const isPrivileged = req.user.role === 'admin' || req.user.role === 'support';
+    if (!isPrivileged && String(req.user.username).toLowerCase() !== username.toLowerCase()) {
+        return res.status(403).json({ error: "Unauthorized access" });
+    }
+
+    try {
+        const user = await dbGetAsync(
+            `SELECT my_referral_id, affiliate_balance FROM users WHERE LOWER(username) = LOWER(?)`,
+            [username]
+        );
+        if (!user) return res.status(404).json({ error: "User not found" });
+        const [stats, referrals] = await Promise.all([
+            dbGetAsync(`SELECT COUNT(*) AS count FROM users WHERE referred_by = ?`, [user.my_referral_id]),
+            dbAllAsync(`SELECT username, created_at, planActivated
+                        FROM users WHERE referred_by = ? ORDER BY created_at DESC`, [user.my_referral_id])
+        ]);
+        return res.json({
+            success: true,
+            totalReferrals: Number(stats?.count || 0),
+            earnings: Number(user.affiliate_balance || 0),
+            referrals
         });
-    });
+    } catch (error) {
+        return sendApiError(res, error, 'Unable to load referral statistics.');
+    }
 });
 
 app.get('/api/referral/leaderboard', (req, res) => {
     // Show only activated referrals count (users who purchased plans)
-    db.all(`SELECT username, affiliate_balance as total_earned, (SELECT COUNT(*) FROM users WHERE referred_by = u.my_referral_id AND planActivated = 'true') as referral_count FROM users u WHERE role = 'user' ORDER BY affiliate_balance DESC LIMIT 10`, [], (err, rows) => {
+    db.all(`SELECT username, affiliate_balance as total_earned, (SELECT COUNT(*) FROM users WHERE referred_by = u.my_referral_id AND LOWER(CAST(planActivated AS TEXT)) IN ('true', '1')) as referral_count FROM users u WHERE role = 'user' ORDER BY affiliate_balance DESC LIMIT 10`, [], (err, rows) => {
         if (err) return res.status(500).json({ error: "Database error" });
         res.json({ success: true, leaderboard: rows || [] });
     });
@@ -2665,7 +3253,7 @@ app.get('/api/referral/leaderboard', (req, res) => {
 // 10. USER PROFILE & BANK DETAILS
 // ==========================================
 app.get('/api/user/profile/:username', authenticateToken, (req, res) => {
-    if (req.user.username !== req.params.username && req.user.role !== 'admin') {
+    if (String(req.user.username).toLowerCase() !== String(req.params.username).toLowerCase() && req.user.role !== 'admin') {
         return res.status(403).json({ error: "Unauthorized" });
     }
     db.get(`SELECT full_name, phone, bank_name, bank_account_number, bank_account_holder FROM users WHERE LOWER(username) = LOWER(?)`,
@@ -2677,54 +3265,68 @@ app.get('/api/user/profile/:username', authenticateToken, (req, res) => {
 
 app.post('/api/user/update-profile', authenticateToken, async (req, res) => {
     try {
-        const { full_name, phone } = req.body;
-        const username = req.user.username;
-        db.run(`UPDATE users SET full_name = ?, phone = ? WHERE LOWER(username) = LOWER(?)`,
-            [full_name || null, phone || null, username], function(err) {
-                if (err) return res.status(500).json({ error: "Database error" });
-                res.json({ success: true, message: "Profile updated successfully" });
-            });
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const fullName = typeof body.full_name === 'string' ? body.full_name.trim().slice(0, 120) : '';
+        const phone = typeof body.phone === 'string' ? body.phone.trim().slice(0, 40) : '';
+        if (!fullName || !phone) {
+            return res.status(400).json({ error: "Full name and phone number are required" });
+        }
+        await dbRunAsync(
+            `UPDATE users SET full_name = ?, phone = ? WHERE LOWER(username) = LOWER(?)`,
+            [fullName, phone, req.user.username]
+        );
+        return res.json({ success: true, message: "Profile updated successfully" });
     } catch (error) {
-        res.status(500).json({ error: "Server error" });
+        return sendApiError(res, error, 'Unable to update your profile.');
     }
 });
 
 app.post('/api/user/update-bank', authenticateToken, async (req, res) => {
     try {
-        const { bank_name, account_number, account_holder } = req.body;
-        const username = req.user.username;
-        if (!bank_name || !account_number || !account_holder) {
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const bankName = typeof body.bank_name === 'string' ? body.bank_name.trim().slice(0, 120) : '';
+        const accountNumber = typeof body.account_number === 'string' ? body.account_number.trim() : '';
+        const accountHolder = typeof body.account_holder === 'string' ? body.account_holder.trim().slice(0, 120) : '';
+        if (!bankName || !accountNumber || !accountHolder) {
             return res.status(400).json({ error: "All bank fields are required" });
         }
-        db.run(`UPDATE users SET bank_name = ?, bank_account_number = ?, bank_account_holder = ? WHERE LOWER(username) = LOWER(?)`,
-            [bank_name, account_number, account_holder, username], function(err) {
-                if (err) return res.status(500).json({ error: "Database error" });
-                res.json({ success: true, message: "Bank details saved successfully" });
-            });
+        if (!/^\d{6,20}$/.test(accountNumber)) {
+            return res.status(400).json({ error: "Account number must contain 6 to 20 digits" });
+        }
+        await dbRunAsync(
+            `UPDATE users SET bank_name = ?, bank_account_number = ?, bank_account_holder = ?
+             WHERE LOWER(username) = LOWER(?)`,
+            [bankName, accountNumber, accountHolder, req.user.username]
+        );
+        return res.json({ success: true, message: "Bank details saved successfully" });
     } catch (error) {
-        res.status(500).json({ error: "Server error" });
+        return sendApiError(res, error, 'Unable to save bank details.');
     }
 });
 
 app.post('/api/user/change-password', authenticateToken, async (req, res) => {
     try {
-        const { current_password, new_password } = req.body;
-        const username = req.user.username;
-        if (!current_password || !new_password || new_password.length < 6) {
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const currentPassword = typeof body.current_password === 'string' ? body.current_password : '';
+        const newPassword = typeof body.new_password === 'string' ? body.new_password : '';
+        if (!currentPassword || newPassword.length < 6) {
             return res.status(400).json({ error: "Current password and new password (min 6 chars) required" });
         }
-        db.get(`SELECT password FROM users WHERE LOWER(username) = LOWER(?)`, [username], async (err, user) => {
-            if (err || !user) return res.status(404).json({ error: "User not found" });
-            const valid = await bcryptjs.compare(current_password, user.password);
-            if (!valid) return res.status(401).json({ error: "Current password is incorrect" });
-            const hashed = await bcryptjs.hash(new_password, 10);
-            db.run(`UPDATE users SET password = ? WHERE LOWER(username) = LOWER(?)`, [hashed, username], function(updateErr) {
-                if (updateErr) return res.status(500).json({ error: "Database error" });
-                res.json({ success: true, message: "Password changed successfully" });
-            });
-        });
+        const user = await dbGetAsync(
+            `SELECT password FROM users WHERE LOWER(username) = LOWER(?)`,
+            [req.user.username]
+        );
+        if (!user) return res.status(404).json({ error: "User not found" });
+        const valid = await bcryptjs.compare(currentPassword, user.password);
+        if (!valid) return res.status(401).json({ error: "Current password is incorrect" });
+        const hashed = await bcryptjs.hash(newPassword, 10);
+        await dbRunAsync(
+            `UPDATE users SET password = ? WHERE LOWER(username) = LOWER(?)`,
+            [hashed, req.user.username]
+        );
+        return res.json({ success: true, message: "Password changed successfully" });
     } catch (error) {
-        res.status(500).json({ error: "Server error" });
+        return sendApiError(res, error, 'Unable to change password.');
     }
 });
 
@@ -2733,15 +3335,19 @@ app.post('/api/user/change-password', authenticateToken, async (req, res) => {
 // ==========================================
 app.post('/api/admin/broadcast', authenticateToken, adminOnly, async (req, res) => {
     try {
-        const { message, title } = req.body;
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const message = typeof body.message === 'string' ? body.message.trim().slice(0, 5000) : '';
+        const title = typeof body.title === 'string' && body.title.trim()
+            ? body.title.trim().slice(0, 200)
+            : 'Admin Announcement';
         if (!message) return res.status(400).json({ error: "Message is required" });
-        db.run(`INSERT INTO broadcasts (title, message, created_by, created_at) VALUES (?, ?, ?, datetime('now'))`, 
-            [title || 'Admin Announcement', message, req.user.username], function(err) {
-            if (err) return res.status(500).json({ error: "Failed to save broadcast" });
-            res.json({ success: true, message: "Broadcast sent to all users" });
-        });
+        await dbRunAsync(
+            `INSERT INTO broadcasts (title, message, created_by, created_at) VALUES (?, ?, ?, datetime('now'))`,
+            [title, message, req.user.username]
+        );
+        return res.json({ success: true, message: "Broadcast sent to all users" });
     } catch (error) {
-        res.status(500).json({ error: "Server error" });
+        return sendApiError(res, error, 'Failed to save broadcast.');
     }
 });
 
@@ -2764,18 +3370,26 @@ app.get('/api/broadcasts/all', authenticateToken, (req, res) => {
 // ==========================================
 app.post('/api/admin/sponsored-post', authenticateToken, adminOnly, async (req, res) => {
     try {
-        const { title, description, reward_amount, required_plan, image_url, link } = req.body;
-        if (!title || !description || !reward_amount) {
-            return res.status(400).json({ error: "Title, description and reward amount are required" });
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const title = typeof body.title === 'string' ? body.title.trim().slice(0, 200) : '';
+        const description = typeof body.description === 'string' ? body.description.trim().slice(0, 5000) : '';
+        const reward = toFiniteNumber(body.reward_amount);
+        const requiredPlan = typeof body.required_plan === 'string' && body.required_plan.trim()
+            ? body.required_plan.trim().slice(0, 120)
+            : 'all';
+        const imageUrl = typeof body.image_url === 'string' ? body.image_url.trim().slice(0, 2000) : null;
+        const link = typeof body.link === 'string' ? body.link.trim().slice(0, 2000) : null;
+        if (!title || !description || reward === null || reward <= 0) {
+            return res.status(400).json({ error: "Title, description and valid reward amount are required" });
         }
-        db.run(`INSERT INTO sponsored_posts (title, description, reward_amount, required_plan, image_url, link, created_by) 
-                VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [title, description, reward_amount, required_plan || 'all', image_url || null, link || null, req.user.username], function(err) {
-            if (err) return res.status(500).json({ error: "Failed to create sponsored post" });
-            res.json({ success: true, message: "Sponsored post created successfully" });
-        });
+        await dbRunAsync(
+            `INSERT INTO sponsored_posts (title, description, reward_amount, required_plan, image_url, link, created_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [title, description, reward, requiredPlan, imageUrl, link, req.user.username]
+        );
+        return res.json({ success: true, message: "Sponsored post created successfully" });
     } catch (error) {
-        res.status(500).json({ error: "Server error" });
+        return sendApiError(res, error, 'Failed to create sponsored post.');
     }
 });
 
@@ -2794,27 +3408,44 @@ app.get('/api/sponsored-posts', authenticateToken, (req, res) => {
 
 app.post('/api/submit-sponsored-task', authenticateToken, async (req, res) => {
     try {
-        const { post_id } = req.body;
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const postId = Number(body.post_id);
         const username = req.user.username;
-        if (!post_id) return res.status(400).json({ error: 'Post ID required' });
-        readSiteSetting('sponsored_posts_open', 'true', (settingErr, sponsoredOpen) => {
-            if (settingErr) return res.status(500).json({ error: 'Failed to load site settings' });
-            if (sponsoredOpen !== 'true') return res.status(403).json({ error: 'Sponsored posts are currently disabled.' });
-            db.get(`SELECT id FROM sponsored_posts WHERE id = ? AND status = 'active'`, [post_id], (err, post) => {
-                if (err || !post) return res.status(404).json({ error: 'Post not found' });
-                db.get(`SELECT id FROM sponsored_submissions WHERE post_id = ? AND username = ?`, [post_id, username], (subErr, existing) => {
-                    if (subErr) return res.status(500).json({ error: 'Database error' });
-                    if (existing) return res.status(400).json({ error: 'You have already submitted this task' });
-                    db.run(`INSERT INTO sponsored_submissions (post_id, username, status) VALUES (?, ?, 'pending')`,
-                        [post_id, username], function(insertErr) {
-                            if (insertErr) return res.status(500).json({ error: 'Failed to submit task' });
-                            res.json({ success: true, message: 'Task submitted for admin review!' });
-                        });
-                });
-            });
-        });
+        if (!Number.isInteger(postId) || postId <= 0) return res.status(400).json({ error: 'Post ID required' });
+
+        const sponsoredOpen = await getSiteSetting('sponsored_posts_open', 'true');
+        if (!isTrueFlag(sponsoredOpen)) return res.status(403).json({ error: 'Sponsored posts are currently disabled.' });
+
+        await withSqliteTransaction(async () => {
+            const user = await dbGetAsync(`SELECT activePackage FROM users WHERE id = ?`, [req.user.id]);
+            if (!user) throw apiError(404, 'User not found.');
+            const userPlan = user.activePackage || 'None';
+            const post = await dbGetAsync(
+                `SELECT id FROM sponsored_posts
+                 WHERE id = ? AND status = 'active'
+                   AND (required_plan = 'all' OR required_plan = ?)`,
+                [postId, userPlan]
+            );
+            if (!post) throw apiError(404, 'Post not found or your plan is not eligible.');
+
+            const existing = await dbGetAsync(
+                `SELECT id FROM sponsored_submissions WHERE post_id = ? AND LOWER(username) = LOWER(?)`,
+                [postId, username]
+            );
+            if (existing) throw apiError(409, 'You have already submitted this task.');
+
+            await dbRunAsync(
+                `INSERT INTO sponsored_submissions (post_id, username, status) VALUES (?, ?, 'pending')`,
+                [postId, username]
+            );
+        }, 'sponsored_submission');
+
+        return res.json({ success: true, message: 'Task submitted for admin review!' });
     } catch (error) {
-        res.status(500).json({ error: 'Server error' });
+        if (String(error?.message || '').includes('UNIQUE constraint failed')) {
+            return res.status(409).json({ error: 'You have already submitted this task.' });
+        }
+        return sendApiError(res, error, 'Failed to submit task.');
     }
 });
 
@@ -2832,22 +3463,44 @@ app.get('/api/admin/sponsored-submissions', authenticateToken, adminOnly, (req, 
 });
 
 app.post('/api/admin/approve-sponsored-submission', authenticateToken, adminOnly, async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const submissionId = body.submission_id;
+    if (!submissionId) return res.status(400).json({ error: "Submission ID required" });
+
     try {
-        const { submission_id } = req.body;
-        if (!submission_id) return res.status(400).json({ error: "Submission ID required" });
-        db.get(`SELECT * FROM sponsored_submissions WHERE id = ? AND status = 'pending'`, [submission_id], (err, submission) => {
-            if (err || !submission) return res.status(404).json({ error: "Submission not found" });
-            db.run(`UPDATE sponsored_submissions SET status = 'approved' WHERE id = ?`, [submission_id], function(updateErr) {
-                if (updateErr) return res.status(500).json({ error: "Failed to update submission" });
-                db.run(`UPDATE users SET taskEarnings = taskEarnings + ? WHERE LOWER(username) = LOWER(?)`,
-                    [submission.reward_amount, submission.username], function(creditErr) {
-                    if (creditErr) return res.status(500).json({ error: "Failed to credit user" });
-                    res.json({ success: true, message: "Submission approved and user credited!" });
-                });
-            });
+        const submission = await withSqliteTransaction(async () => {
+            const pending = await dbGetAsync(
+                `SELECT s.*, p.reward_amount
+                 FROM sponsored_submissions s
+                 JOIN sponsored_posts p ON p.id = s.post_id
+                 WHERE s.id = ? AND s.status = 'pending'`,
+                [submissionId]
+            );
+            if (!pending) throw apiError(409, "Submission not found or already processed.");
+            const reward = toFiniteNumber(pending.reward_amount);
+            if (reward === null || reward <= 0) throw new Error('Sponsored submission has an invalid reward.');
+
+            const updateResult = await dbRunAsync(
+                `UPDATE sponsored_submissions SET status = 'approved' WHERE id = ? AND status = 'pending'`,
+                [submissionId]
+            );
+            if (!updateResult.changes) throw apiError(409, "Submission was already processed.");
+
+            const creditResult = await dbRunAsync(
+                `UPDATE users SET taskEarnings = COALESCE(taskEarnings, 0) + ?
+                 WHERE LOWER(username) = LOWER(?)`,
+                [reward, pending.username]
+            );
+            if (!creditResult.changes) throw apiError(404, 'Submission user no longer exists.');
+            return { ...pending, reward_amount: reward };
+        }, 'approve_sponsored_submission');
+
+        return res.json({
+            success: true,
+            message: `Submission approved and ₦${submission.reward_amount.toLocaleString()} credited to ${submission.username}.`
         });
     } catch (error) {
-        res.status(500).json({ error: "Server error" });
+        return sendApiError(res, error, 'Failed to approve sponsored submission.');
     }
 });
 
@@ -2860,138 +3513,225 @@ app.get('/api/sponsored-submission-status/:post_id', authenticateToken, (req, re
     });
 });
 
-// Premium feature helper (ads, bills, sms)
-function verifyPremiumAccess(username, cost, res, callback) {
-    if (!isValidAmount(cost)) return res.status(400).json({ error: "Invalid amount." });
-    db.get(`SELECT balance, planActivated FROM users WHERE LOWER(username) = LOWER(?)`, [username], (err, user) => {
-        if (err || !user) return res.status(400).json({ error: "User not found" });
-        if (user.planActivated !== 'true') return res.status(403).json({ error: "Premium Feature Locked. Please activate a plan." });
-        if (user.balance < cost) return res.status(400).json({ error: "Insufficient balance." });
-        db.run(`UPDATE users SET balance = balance - ?, wallet_balance = wallet_balance - ? WHERE LOWER(username) = LOWER(?) AND balance >= ?`, [cost, cost, username, cost], function (updateErr) {
-            if (updateErr) return res.status(500).json({ error: "Database error." });
-            if (this.changes === 0) return res.status(400).json({ error: "Insufficient balance or user not found." });
-            callback(user.balance - cost);
-        });
-    });
+// Premium feature helper (ads, bills, sms). The charge and the feature record
+// must be one SQLite transaction; otherwise a failed INSERT can permanently
+// deduct a user's balance.
+async function runPremiumPurchase(username, cost, insertSql, insertParams, label) {
+    const numericCost = toFiniteNumber(cost);
+    if (numericCost === null || numericCost <= 0) throw apiError(400, 'Invalid amount.');
+
+    return withSqliteTransaction(async () => {
+        const user = await dbGetAsync(
+            `SELECT balance, planActivated FROM users WHERE LOWER(username) = LOWER(?)`,
+            [username]
+        );
+        if (!user) throw apiError(404, 'User not found.');
+        if (!isTrueFlag(user.planActivated)) {
+            throw apiError(403, 'Premium Feature Locked. Please activate a plan.');
+        }
+        const balance = toFiniteNumber(user.balance) || 0;
+        if (balance < numericCost) throw apiError(400, 'Insufficient balance.');
+
+        const updateResult = await dbRunAsync(
+            `UPDATE users
+             SET balance = COALESCE(balance, 0) - ?,
+                 wallet_balance = COALESCE(wallet_balance, 0) - ?
+             WHERE LOWER(username) = LOWER(?) AND COALESCE(balance, 0) >= ?`,
+            [numericCost, numericCost, username, numericCost]
+        );
+        if (!updateResult.changes) throw apiError(409, 'Your balance changed before the purchase completed. Please try again.');
+
+        await dbRunAsync(insertSql, insertParams);
+        return { newBalance: balance - numericCost, cost: numericCost };
+    }, label);
 }
 
-app.post('/api/ads/create', authenticateToken, actionLimiter, (req, res) => {
-    verifyPremiumAccess(req.user.username, req.body.price, res, (b) => {
-        db.run(`INSERT INTO ads (username, title, url, image, price) VALUES (?, ?, ?, ?, ?)`, [req.user.username, req.body.title, req.body.url, req.body.image, req.body.price], () => {
-            res.json({ success: true, newBalance: b });
-        });
-    });
+app.post('/api/ads/create', authenticateToken, actionLimiter, async (req, res) => {
+    try {
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const title = typeof body.title === 'string' ? body.title.trim().slice(0, 200) : '';
+        const url = typeof body.url === 'string' ? body.url.trim().slice(0, 2000) : '';
+        const image = typeof body.image === 'string' ? body.image : null;
+        if (!title || !url) return res.status(400).json({ error: 'Ad title and URL are required.' });
+        const result = await runPremiumPurchase(
+            req.user.username,
+            body.price,
+            `INSERT INTO ads (username, title, url, image, price) VALUES (?, ?, ?, ?, ?)`,
+            [req.user.username, title, url, image, toFiniteNumber(body.price)],
+            'create_ad'
+        );
+        return res.json({ success: true, newBalance: result.newBalance });
+    } catch (error) {
+        return sendApiError(res, error, 'Unable to create ad.');
+    }
 });
 
-app.post('/api/bills/airtime', authenticateToken, actionLimiter, (req, res) => {
-    verifyPremiumAccess(req.user.username, req.body.amount, res, (b) => {
-        db.run(`INSERT INTO bills (username, bill_type, network, phone, amount) VALUES (?, 'airtime', ?, ?, ?)`, [req.user.username, req.body.network, req.body.phone, req.body.amount], () => {
-            res.json({ success: true, newBalance: b });
-        });
-    });
+app.post('/api/bills/airtime', authenticateToken, actionLimiter, async (req, res) => {
+    try {
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const network = typeof body.network === 'string' ? body.network.trim().slice(0, 50) : '';
+        const phone = typeof body.phone === 'string' ? body.phone.trim().slice(0, 30) : '';
+        const amount = toFiniteNumber(body.amount);
+        if (!network || !phone || amount === null) return res.status(400).json({ error: 'Network, phone and valid amount are required.' });
+        const result = await runPremiumPurchase(
+            req.user.username,
+            amount,
+            `INSERT INTO bills (username, bill_type, network, phone, amount) VALUES (?, 'airtime', ?, ?, ?)`,
+            [req.user.username, network, phone, amount],
+            'buy_airtime'
+        );
+        return res.json({ success: true, newBalance: result.newBalance });
+    } catch (error) {
+        return sendApiError(res, error, 'Unable to purchase airtime.');
+    }
 });
 
-app.post('/api/bills/data', authenticateToken, actionLimiter, (req, res) => {
-    verifyPremiumAccess(req.user.username, req.body.amount, res, (b) => {
-        db.run(`INSERT INTO bills (username, bill_type, network, phone, amount) VALUES (?, 'data', ?, ?, ?)`, [req.user.username, req.body.network, req.body.phone, req.body.amount], () => {
-            res.json({ success: true, newBalance: b });
-        });
-    });
+app.post('/api/bills/data', authenticateToken, actionLimiter, async (req, res) => {
+    try {
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const network = typeof body.network === 'string' ? body.network.trim().slice(0, 50) : '';
+        const phone = typeof body.phone === 'string' ? body.phone.trim().slice(0, 30) : '';
+        const amount = toFiniteNumber(body.amount);
+        if (!network || !phone || amount === null) return res.status(400).json({ error: 'Network, phone and valid amount are required.' });
+        const result = await runPremiumPurchase(
+            req.user.username,
+            amount,
+            `INSERT INTO bills (username, bill_type, network, phone, amount) VALUES (?, 'data', ?, ?, ?)`,
+            [req.user.username, network, phone, amount],
+            'buy_data'
+        );
+        return res.json({ success: true, newBalance: result.newBalance });
+    } catch (error) {
+        return sendApiError(res, error, 'Unable to purchase data.');
+    }
 });
 
-app.post('/api/sms/send', authenticateToken, actionLimiter, (req, res) => {
-    verifyPremiumAccess(req.user.username, req.body.cost, res, (b) => {
-        db.run(`INSERT INTO bulk_sms (username, sender_id, recipients_count, total_cost) VALUES (?, ?, ?, ?)`, [req.user.username, req.body.senderId, req.body.count, req.body.cost], () => {
-            res.json({ success: true, newBalance: b });
-        });
-    });
-});
-
-function processActiveInvestmentCycles() {
-    db.all(`
-        SELECT i.*, u.id as linked_user_id
-        FROM user_investments i
-        JOIN users u ON u.id = i.user_id
-        WHERE i.status = 'active'
-    `, [], (err, investments) => {
-        if (err) {
-            console.error('Investment cron read error:', err.message);
-            return;
+app.post('/api/sms/send', authenticateToken, actionLimiter, async (req, res) => {
+    try {
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        const senderId = typeof body.senderId === 'string' ? body.senderId.trim().slice(0, 20) : '';
+        const count = Number(body.count);
+        const cost = toFiniteNumber(body.cost);
+        if (!senderId || !Number.isInteger(count) || count <= 0 || cost === null) {
+            return res.status(400).json({ error: 'Sender ID, recipient count and valid cost are required.' });
         }
+        const result = await runPremiumPurchase(
+            req.user.username,
+            cost,
+            `INSERT INTO bulk_sms (username, sender_id, recipients_count, total_cost) VALUES (?, ?, ?, ?)`,
+            [req.user.username, senderId, count, cost],
+            'send_sms'
+        );
+        return res.json({ success: true, newBalance: result.newBalance });
+    } catch (error) {
+        return sendApiError(res, error, 'Unable to send SMS.');
+    }
+});
 
-        if (!investments || investments.length === 0) return;
+let investmentCycleProcessing = false;
 
+async function processActiveInvestmentCycles() {
+    if (investmentCycleProcessing) return;
+    investmentCycleProcessing = true;
+    try {
+        const investments = await dbAllAsync(`
+            SELECT i.*, u.id AS linked_user_id
+            FROM user_investments i
+            JOIN users u ON u.id = i.user_id
+            WHERE i.status = 'active'
+        `);
         const now = Date.now();
-        investments.forEach((inv) => {
-            const activatedAtMs = new Date(inv.activated_at).getTime();
-            if (Number.isNaN(activatedAtMs)) return;
+
+        for (const investment of investments) {
+            const activatedAtMs = new Date(investment.activated_at).getTime();
+            const cycleDays = Number(investment.cycle_days);
+            const dailyEarning = toFiniteNumber(investment.daily_earning);
+            if (!Number.isFinite(activatedAtMs) || !Number.isInteger(cycleDays) || cycleDays <= 0 || dailyEarning === null || dailyEarning < 0) {
+                console.error(`Skipping invalid investment cycle #${investment.id}.`);
+                continue;
+            }
 
             const elapsedDays = Math.floor((now - activatedAtMs) / (24 * 60 * 60 * 1000));
-            const targetCreditedDays = Math.min(inv.cycle_days, Math.max(0, elapsedDays));
-            const dueDays = targetCreditedDays - (inv.days_credited || 0);
+            const targetCreditedDays = Math.min(cycleDays, Math.max(0, elapsedDays));
+            if (targetCreditedDays <= Number(investment.days_credited || 0)) continue;
 
-            if (dueDays > 0) {
-                const payoutAmount = dueDays * inv.daily_earning;
-                db.run(
-                    `UPDATE users SET daily_earnings = COALESCE(daily_earnings, 0) + ? WHERE id = ?`,
-                    [payoutAmount, inv.user_id],
-                    (creditErr) => {
-                        if (creditErr) {
-                            console.error(`Investment payout credit failed for ${inv.username}:`, creditErr.message);
-                            return;
+            try {
+                await withSqliteTransaction(async () => {
+                    const current = await dbGetAsync(
+                        `SELECT * FROM user_investments WHERE id = ? AND status = 'active'`,
+                        [investment.id]
+                    );
+                    if (!current) return;
+
+                    const creditedDays = Number(current.days_credited || 0);
+                    const targetDays = Math.min(cycleDays, Math.max(creditedDays, targetCreditedDays));
+                    const dueDays = targetDays - creditedDays;
+                    if (dueDays <= 0) return;
+
+                    const payoutAmount = dueDays * dailyEarning;
+                    const payoutResult = await dbRunAsync(
+                        `UPDATE users
+                         SET daily_earnings = COALESCE(daily_earnings, 0) + ?
+                         WHERE id = ?`,
+                        [payoutAmount, current.user_id]
+                    );
+                    if (!payoutResult.changes) throw new Error(`User ${current.user_id} no longer exists.`);
+
+                    if (targetDays >= cycleDays) {
+                        const capital = toFiniteNumber(current.capital);
+                        if (capital === null || capital < 0) throw new Error(`Investment #${current.id} has invalid capital.`);
+                        const completionResult = await dbRunAsync(
+                            `UPDATE users
+                             SET balance = COALESCE(balance, 0) + ?,
+                                 wallet_balance = COALESCE(wallet_balance, 0) + ?,
+                                 planActivated = 'false',
+                                 activePackage = 'None',
+                                 activePackageId = NULL
+                             WHERE id = ?`,
+                            [capital, capital, current.user_id]
+                        );
+                        if (!completionResult.changes) {
+                            throw new Error(`Could not complete investment #${current.id} for user ${current.user_id}.`);
                         }
-
-                        db.run(
-                            `UPDATE user_investments SET days_credited = ? WHERE id = ?`,
-                            [targetCreditedDays, inv.id],
-                            (updateErr) => {
-                                if (updateErr) {
-                                    console.error(`Investment days_credited update failed for #${inv.id}:`, updateErr.message);
-                                }
-                            }
+                        const completeResult = await dbRunAsync(
+                            `UPDATE user_investments
+                             SET days_credited = ?, status = 'completed', completed_at = datetime('now')
+                             WHERE id = ? AND status = 'active'`,
+                            [targetDays, current.id]
+                        );
+                        if (!completeResult.changes) throw new Error(`Could not close investment #${current.id}.`);
+                    } else {
+                        await dbRunAsync(
+                            `UPDATE user_investments SET days_credited = ? WHERE id = ? AND status = 'active'`,
+                            [targetDays, current.id]
                         );
                     }
-                );
+                }, `investment_cycle_${investment.id}`);
+            } catch (error) {
+                console.error(`Investment cycle #${investment.id} failed:`, error.message);
             }
-
-            if (targetCreditedDays >= inv.cycle_days) {
-                db.run(
-                    `UPDATE users
-                     SET balance = COALESCE(balance, 0) + ?,
-                         wallet_balance = COALESCE(wallet_balance, 0) + ?,
-                         planActivated = 'false',
-                         activePackage = 'None',
-                         activePackageId = NULL
-                     WHERE id = ? AND planActivated = 'true'`,
-                    [inv.capital, inv.capital, inv.user_id],
-                    (userUpdateErr) => {
-                        if (userUpdateErr) {
-                            console.error(`Investment completion user update failed for ${inv.username}:`, userUpdateErr.message);
-                            return;
-                        }
-
-                        db.run(
-                            `UPDATE user_investments SET status = 'completed', completed_at = datetime('now') WHERE id = ? AND status = 'active'`,
-                            [inv.id],
-                            (completeErr) => {
-                                if (completeErr) {
-                                    console.error(`Investment completion update failed for #${inv.id}:`, completeErr.message);
-                                }
-                            }
-                        );
-                    }
-                );
-            }
-        });
-    });
+        }
+    } catch (error) {
+        console.error('Investment cron read error:', error.message);
+    } finally {
+        investmentCycleProcessing = false;
+    }
 }
 
 // ==========================================
 // GLOBAL ERROR HANDLER & SHUTDOWN
 // ==========================================
 app.use((err, req, res, next) => {
-    console.error(`UNHANDLED ERROR:`, err.stack);
-    res.status(500).json({ error: "Internal server error" });
+    if (err && err.type === 'entity.parse.failed') {
+        return res.status(400).json({ error: 'Request body must contain valid JSON.' });
+    }
+    if (err && err.type === 'entity.too.large') {
+        return res.status(413).json({ error: 'Request body is too large.' });
+    }
+    if (res.headersSent) return next(err);
+
+    console.error(`UNHANDLED ERROR:`, err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: "Internal server error" });
 });
 
 process.on('unhandledRejection', (reason) => {
@@ -3007,6 +3747,12 @@ process.on('SIGTERM', () => {
 
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Access Wealth API listening on port ${PORT}`);
+    if (configuredFrontendOrigins.length) {
+        console.log(`CORS configured for ${configuredFrontendOrigins.join(', ')}`);
+    } else {
+        console.log('CORS using the default Access Wealth frontend origins. Set FRONTEND_URL for a deployed frontend origin.');
+    }
     processActiveInvestmentCycles();
     setInterval(processActiveInvestmentCycles, 60 * 60 * 1000);
 });

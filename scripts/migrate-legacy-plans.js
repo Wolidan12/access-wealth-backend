@@ -1,6 +1,6 @@
 require('dotenv').config();
 const path = require('path');
-const sqlite3 = require('sqlite3').verbose();
+const sqlite3 = require('../sqlite-compat');
 
 const dbPath = process.env.RAILWAY_VOLUME_MOUNT_PATH
     ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'database.sqlite')
@@ -90,12 +90,13 @@ async function runMigration() {
     const statusColumn = pickFirst(planColumns, ['status', 'plan_status']);
     const capitalColumn = pickFirst(planColumns, ['capital', 'deposit_amount', 'amount', 'principal']);
     const packageIdColumn = pickFirst(planColumns, ['package_id', 'plan_id']);
+    const planIdColumn = pickFirst(planColumns, ['id', 'investment_id']);
     const planUserIdColumn = pickFirst(planColumns, ['user_id', 'uid']);
     const planUsernameColumn = pickFirst(planColumns, ['username', 'user_name']);
 
-    if (!statusColumn || !capitalColumn || (!planUserIdColumn && !planUsernameColumn)) {
+    if (!statusColumn || !capitalColumn || !planIdColumn || (!planUserIdColumn && !planUsernameColumn)) {
         throw new Error(
-            `Unsupported legacy table shape for ${activePlanTable}. Required: status, capital/deposit_amount, and user_id or username.`
+            `Unsupported legacy table shape for ${activePlanTable}. Required: id, status, capital/deposit_amount, and user_id or username.`
         );
     }
 
@@ -161,9 +162,8 @@ async function runMigration() {
                 refundedTotal += refundableCapital;
             }
 
-            if (plan.id) {
+            if (plan[planIdColumn]) {
                 const setFragments = [`${statusColumn} = 'cancelled_system_upgrade'`];
-                const params = [];
 
                 if (completeAtColumn && completeAtColumn !== 'updated_at') {
                     setFragments.push(`${completeAtColumn} = datetime('now')`);
@@ -178,8 +178,8 @@ async function runMigration() {
                 });
 
                 await run(
-                    `UPDATE ${activePlanTable} SET ${setFragments.join(', ')} WHERE id = ?`,
-                    [plan.id]
+                    `UPDATE ${activePlanTable} SET ${setFragments.join(', ')} WHERE ${planIdColumn} = ?`,
+                    [plan[planIdColumn]]
                 );
             }
         }
@@ -223,11 +223,15 @@ async function runMigration() {
             }
         }
 
-        if (userColumns.includes('planActivated') || userColumns.includes('activePackage') || userColumns.includes('activePackageId')) {
+        const resetUserColumns = [];
+        if (userColumns.includes('planActivated')) resetUserColumns.push("planActivated = 'false'");
+        if (userColumns.includes('activePackage')) resetUserColumns.push("activePackage = 'None'");
+        if (userColumns.includes('activePackageId')) resetUserColumns.push('activePackageId = NULL');
+        if (resetUserColumns.length) {
             if (affectedUserIds.size > 0) {
                 for (const userId of affectedUserIds) {
                     await run(
-                        "UPDATE users SET planActivated = 'false', activePackage = 'None', activePackageId = NULL WHERE id = ?",
+                        `UPDATE users SET ${resetUserColumns.join(', ')} WHERE id = ?`,
                         [userId]
                     );
                 }
@@ -235,7 +239,7 @@ async function runMigration() {
             if (affectedUsernames.size > 0) {
                 for (const username of affectedUsernames) {
                     await run(
-                        "UPDATE users SET planActivated = 'false', activePackage = 'None', activePackageId = NULL WHERE LOWER(username) = LOWER(?)",
+                        `UPDATE users SET ${resetUserColumns.join(', ')} WHERE LOWER(username) = LOWER(?)`,
                         [username]
                     );
                 }
@@ -243,9 +247,10 @@ async function runMigration() {
         }
 
         await run('COMMIT');
+        console.log(`Legacy migration completed: ${refundedPlans} plan(s) refunded, NGN ${refundedTotal.toFixed(2)} returned.`);
 
     } catch (error) {
-        await run('ROLLBACK');
+        try { await run('ROLLBACK'); } catch (_) {}
         throw error;
     }
 }
