@@ -2,7 +2,7 @@ try {
     require('dotenv').config();
 } catch (_) {}
 const path = require('path');
-const sqlite3 = require('sqlite3').verbose();
+const sqlite3 = require('../sqlite-compat');
 
 const dbPath = process.env.RAILWAY_VOLUME_MOUNT_PATH
     ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'database.sqlite')
