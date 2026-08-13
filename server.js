@@ -695,7 +695,14 @@ const dbPath = process.env.RAILWAY_VOLUME_MOUNT_PATH
 
 const db = new sqlite3.Database(dbPath, (err) => {
     if (err) {
-        console.error("Database connection error:", err.message);
+        // If the database cannot be opened, every endpoint (including login)
+        // would fail. Exit immediately so the platform restart policy kicks in
+        // and the deploy logs show exactly why instead of a vague "Network
+        // error" on every sign-in attempt.
+        console.error('FATAL: Could not open the SQLite database at', dbPath);
+        console.error('FATAL:', err.message);
+        console.error('FATAL: Check that RAILWAY_VOLUME_MOUNT_PATH points to a mounted, writable volume. Exiting so the platform can restart the container.');
+        process.exit(1);
     } else {
         db.configure('busyTimeout', 2000);
         db.run("PRAGMA journal_mode=WAL;", (pragmaErr) => {
@@ -1252,6 +1259,20 @@ app.get(['/health', '/api/health'], (req, res) => {
             return res.status(503).json({ status: 'error', database: 'ok', authentication: 'not_configured' });
         }
         return res.json({ status: 'ok', database: 'ok', authentication: 'ok' });
+    });
+});
+
+// Identify which service a domain actually points at. If someone opens the API
+// domain in a browser they get JSON here; the marketing/SPA frontend would
+// return HTML instead. This makes a misconfigured custom domain (frontend and
+// API swapped, or /api not routed to this service) obvious instead of looking
+// like a network error on every login attempt.
+app.get(['/', '/api'], (req, res) => {
+    res.json({
+        service: 'Access Wealth API',
+        status: 'running',
+        health: '/health',
+        hint: 'The frontend should call /api/* endpoints on this service.'
     });
 });
 
@@ -3738,16 +3759,41 @@ process.on('unhandledRejection', (reason) => {
     console.error('UNHANDLED PROMISE REJECTION:', reason);
 });
 
-process.on('SIGTERM', () => {
-    db.close((err) => {
-        if (err) console.error('Error closing DB:', err.message);
-        process.exit(0);
-    });
+process.on('uncaughtException', (error) => {
+    console.error('UNCAUGHT EXCEPTION:', error && error.stack ? error.stack : error);
 });
+
+// Graceful shutdown. Railway sends SIGTERM before stopping a container; close
+// the database first so SQLite (WAL) files stay consistent. A hard-exit timer
+// guarantees the process never hangs past the platform's grace period — a
+// hung shutdown is what makes deploy logs end in a bare SIGTERM with no
+// explanation.
+function shutdown(signal) {
+    console.log(`${signal} received. Closing the database and shutting down...`);
+    const forceExitTimer = setTimeout(() => {
+        console.error('Graceful shutdown timed out after 8s. Exiting forcefully.');
+        process.exit(1);
+    }, 8000);
+    forceExitTimer.unref();
+    try {
+        db.close((err) => {
+            clearTimeout(forceExitTimer);
+            if (err) console.error('Error closing DB:', err.message);
+            process.exit(0);
+        });
+    } catch (err) {
+        console.error('Error during shutdown:', err.message);
+        process.exit(1);
+    }
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Access Wealth API listening on port ${PORT}`);
+    console.log(`Startup summary -> NODE_ENV: ${process.env.NODE_ENV || 'development'} | Database: ${dbPath}`);
+    console.log(`Startup summary -> JWT_SECRET: ${jwtSecret ? 'configured' : 'NOT CONFIGURED (login/register return 503 until it is set)'}`);
     if (configuredFrontendOrigins.length) {
         console.log(`CORS configured for ${configuredFrontendOrigins.join(', ')}`);
     } else {
