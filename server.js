@@ -1341,10 +1341,18 @@ app.post('/api/login', authLimiter, async (req, res) => {
 
     try {
         const body = req.body && typeof req.body === 'object' ? req.body : {};
-        const username = typeof body.username === 'string' ? body.username.trim() : '';
+        // Accept the field names used by the older web and mobile clients too.
+        // The account is still stored under `username`; accepting `email` or
+        // `identifier` here prevents an otherwise valid sign-in from being
+        // rejected simply because the client was not upgraded at the same time
+        // as the API.
+        const usernameValue = [body.username, body.email, body.identifier, body.userName]
+            .find((value) => typeof value === 'string' && value.trim());
+        const username = typeof usernameValue === 'string' ? usernameValue.trim() : '';
         // Passwords are deliberately not trimmed: spaces can be valid password
         // characters and changing them here would make a valid login fail.
-        const password = typeof body.password === 'string' ? body.password : '';
+        const password = typeof body.password === 'string' ? body.password :
+            (typeof body.passcode === 'string' ? body.passcode : '');
 
         if (!username || !password) {
             return res.status(400).json({ error: "Username and password required" });
@@ -1362,7 +1370,22 @@ app.post('/api/login', authLimiter, async (req, res) => {
             return res.status(403).json({ error: "Your account has been suspended. Please contact support." });
         }
 
-        const passwordMatch = await bcryptjs.compare(password, user.password);
+        let passwordMatch = await bcryptjs.compare(password, user.password);
+
+        // A few accounts created by the original deployment contain a legacy
+        // plaintext password. Keep those users from being permanently locked
+        // out after the bcrypt migration, but immediately replace the legacy
+        // value with a bcrypt hash after a successful match. New passwords are
+        // always written as bcrypt hashes by /api/register.
+        const looksLikeBcrypt = /^\$2[aby]?\$\d{2}\$/.test(user.password);
+        if (!passwordMatch && !looksLikeBcrypt && user.password === password) {
+            passwordMatch = true;
+            const upgradedPassword = await bcryptjs.hash(password, 10);
+            await dbRunAsync('UPDATE users SET password = ? WHERE id = ?', [upgradedPassword, user.id]);
+            user.password = upgradedPassword;
+            console.warn(`Upgraded legacy password hash for user id ${user.id}.`);
+        }
+
         if (!passwordMatch) {
             return res.status(400).json({ error: "Invalid username or password" });
         }
