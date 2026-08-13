@@ -1154,43 +1154,81 @@ db.serialize(() => {
         );
     });
 
-    // Admin and support accounts
+    // Admin and support accounts.
+    //
+    // These lookups are keyed by USERNAME (not by role) and promote an existing
+    // row when its role is wrong. The previous implementation used
+    // `INSERT OR IGNORE` keyed on the username UNIQUE constraint, which silently
+    // did nothing when admin@accesswealth.com (or support@accesswealth.com)
+    // already existed as a regular user — e.g. an account registered before the
+    // bootstrap ran, or a legacy row whose `role` column was backfilled to
+    // 'user' during a migration. That left the app with no usable admin/support
+    // account and made every admin-only endpoint return 403 "Admin access
+    // required" (which the frontend surfaces as an "Unable to load ..." error).
     setTimeout(() => {
-        db.get(`SELECT id FROM users WHERE role = 'admin' LIMIT 1`, (err, row) => {
-            if (err) console.error("Admin check error:", err.message);
-            if (!row) {
-                const adminBootstrapPassword = process.env.ADMIN_BOOTSTRAP_PASSWORD;
-                if (!adminBootstrapPassword) {
-                    console.warn('ADMIN_BOOTSTRAP_PASSWORD is not set. Skipping admin auto-bootstrap user creation.');
-                    return;
-                }
-                const adminHash = bcryptjs.hashSync(adminBootstrapPassword, 10);
-                db.run(`INSERT OR IGNORE INTO users (username, password, role, my_referral_id, planActivated, activePackage, activePackageId)
-                    VALUES (?, ?, 'admin', 'ADMIN123', 'true', 'Elite Apex', 'elite_apex')`,
-                        ['admin@accesswealth.com', adminHash], function(insertErr) {
-                    if (insertErr) console.error("Failed to create admin:", insertErr.message);
-                });
-            }
+        bootstrapStaffAccount({
+            username: 'admin@accesswealth.com',
+            role: 'admin',
+            referralId: 'ADMIN123',
+            passwordEnv: 'ADMIN_BOOTSTRAP_PASSWORD'
         });
-
-        db.get(`SELECT id FROM users WHERE role = 'support' LIMIT 1`, (err, row) => {
-            if (err) console.error("Support check error:", err.message);
-            if (!row) {
-                const supportBootstrapPassword = process.env.SUPPORT_BOOTSTRAP_PASSWORD;
-                if (!supportBootstrapPassword) {
-                    console.warn('SUPPORT_BOOTSTRAP_PASSWORD is not set. Skipping support auto-bootstrap user creation.');
-                    return;
-                }
-                const supportHash = bcryptjs.hashSync(supportBootstrapPassword, 10);
-                db.run(`INSERT OR IGNORE INTO users (username, password, role, my_referral_id, planActivated, activePackage, activePackageId)
-                    VALUES (?, ?, 'support', 'SUPPORT123', 'true', 'Elite Apex', 'elite_apex')`,
-                        ['support@accesswealth.com', supportHash], function(insertErr) {
-                    if (insertErr) console.error("Failed to create support:", insertErr.message);
-                });
-            }
+        bootstrapStaffAccount({
+            username: 'support@accesswealth.com',
+            role: 'support',
+            referralId: 'SUPPORT123',
+            passwordEnv: 'SUPPORT_BOOTSTRAP_PASSWORD'
         });
     }, 500);
 });
+
+// Creates or repairs the bootstrap staff account. Ensures the account exists
+// with the given role, promoting it (and, when promoting, resetting its
+// password to the configured bootstrap password) if it already exists with a
+// different role. Already-correct accounts are left untouched so a password an
+// admin changed later survives restarts.
+function bootstrapStaffAccount({ username, role, referralId, passwordEnv }) {
+    db.get(`SELECT id, role FROM users WHERE LOWER(username) = LOWER(?)`, [username], (err, row) => {
+        if (err) {
+            console.error(`${role} bootstrap check error:`, err.message);
+            return;
+        }
+
+        if (!row) {
+            const bootstrapPassword = process.env[passwordEnv];
+            if (!bootstrapPassword) {
+                console.warn(`${passwordEnv} is not set. Skipping ${role} auto-bootstrap user creation.`);
+                return;
+            }
+            const hash = bcryptjs.hashSync(bootstrapPassword, 10);
+            db.run(
+                `INSERT INTO users (username, password, role, my_referral_id, planActivated, activePackage, activePackageId)
+                 VALUES (?, ?, ?, ?, 'true', 'Elite Apex', 'elite_apex')`,
+                [username, hash, role, referralId],
+                (insertErr) => {
+                    if (insertErr) console.error(`Failed to create ${role} account:`, insertErr.message);
+                    else console.warn(`[BOOTSTRAP] Created ${role} account ${username}.`);
+                }
+            );
+            return;
+        }
+
+        if (String(row.role || '').toLowerCase() === role) return;
+
+        const bootstrapPassword = process.env[passwordEnv];
+        if (bootstrapPassword) {
+            const hash = bcryptjs.hashSync(bootstrapPassword, 10);
+            db.run(`UPDATE users SET role = ?, password = ? WHERE id = ?`, [role, hash, row.id], (updateErr) => {
+                if (updateErr) console.error(`Failed to promote ${role} account:`, updateErr.message);
+                else console.warn(`[BOOTSTRAP] Promoted ${username} to ${role} role.`);
+            });
+        } else {
+            db.run(`UPDATE users SET role = ? WHERE id = ?`, [role, row.id], (updateErr) => {
+                if (updateErr) console.error(`Failed to promote ${role} account:`, updateErr.message);
+                else console.warn(`[BOOTSTRAP] Promoted ${username} to ${role} role.`);
+            });
+        }
+    });
+}
 
 // Lightweight deployment probe. A frontend can distinguish "the API is down"
 // from a bad username/password, and Railway/other hosts can use this endpoint
