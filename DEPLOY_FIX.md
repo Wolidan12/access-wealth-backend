@@ -98,8 +98,8 @@ server now prints a clear `FATAL:` reason instead of dying silently.
   stores `database.sqlite` there and now **exits with a FATAL message** if it
   cannot open the database, instead of serving broken endpoints.
 - `PORT` — leave unset (defaults to 3000) or set 3000.
-- `SQUAD_SECRET_KEY`, `ADMIN_BOOTSTRAP_PASSWORD`, `SUPPORT_BOOTSTRAP_PASSWORD` —
-  not needed for sign-in, but set them for the related features.
+- `ADMIN_BOOTSTRAP_PASSWORD`, `SUPPORT_BOOTSTRAP_PASSWORD` — not needed for
+  sign-in, but set them to auto-create the admin/support accounts.
 
 ### 6. Redeploy and verify
 

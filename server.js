@@ -6,7 +6,6 @@ const path = require('path');
 const sqlite3 = require('./sqlite-compat');
 const jwt = require('jsonwebtoken');
 const bcryptjs = require('bcryptjs');
-const axios = require('axios');
 const crypto = require('crypto');
 const { AsyncLocalStorage } = require('async_hooks');
 const rateLimit = require('express-rate-limit');
@@ -122,10 +121,6 @@ if (!jwtSecret) {
     console.error('ERROR: JWT_SECRET is not configured. Authentication endpoints will return 503 until it is set.');
 }
 
-if (!process.env.SQUAD_SECRET_KEY) {
-    console.warn('WARN: SQUAD_SECRET_KEY is missing. Squad deposit and webhook endpoints will be unavailable.');
-}
-
 app.set('trust proxy', 1);
 // The API is intentionally consumed by a separate frontend origin. Allow
 // CORS-approved responses to be read as cross-origin resources; the default
@@ -213,7 +208,7 @@ app.use(cors({
         return callback(null, false);
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-squad-encrypted-body', 'x-squad-signature'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true
 }));
 
@@ -229,8 +224,8 @@ app.use(express.urlencoded({ extended: false, limit: '100kb' }));
 
 // ==========================================
 // MANUAL PAYMENT CONFIGURATION
-// Squad live API is not available yet, so deposits are handled manually.
-// Users transfer to this account and upload a payment receipt for admin approval.
+// Deposits are handled manually: users transfer to this account and upload a
+// payment receipt for admin approval.
 // ==========================================
 const MANUAL_PAYMENT_INFO = {
     bank_name: process.env.MANUAL_BANK_NAME || 'Moniepoint',
@@ -356,10 +351,6 @@ function isTrueFlag(value) {
     return value === true || value === 1 || ['true', '1'].includes(String(value ?? '').toLowerCase());
 }
 
-function isValidEmail(email) {
-    return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
-}
-
 const APP_TIME_ZONE = process.env.APP_TIME_ZONE || 'Africa/Lagos';
 function getClaimDate(date = new Date()) {
     try {
@@ -372,49 +363,6 @@ function getClaimDate(date = new Date()) {
     } catch (error) {
         console.warn(`Invalid APP_TIME_ZONE "${APP_TIME_ZONE}"; falling back to UTC.`);
         return date.toISOString().split('T')[0];
-    }
-}
-
-function getSquadApiUrl() {
-    return process.env.SQUAD_API_URL || process.env.SQUAD_BASE_URL || 'https://sandbox-api-d.squadco.com';
-}
-
-function ensureSquadConfigured(res) {
-    const secret = (process.env.SQUAD_SECRET_KEY || '').trim();
-    const isSandbox = getSquadApiUrl().includes('sandbox-api');
-    if (!secret) {
-        res.status(503).json({ error: 'Squad gateway is not configured on the server.' });
-        return false;
-    }
-    if (isSandbox && !secret.startsWith('sandbox_sk_')) {
-        res.status(503).json({ error: 'Squad sandbox configuration is invalid. Set Railway SQUAD_SECRET_KEY to the sandbox key from the Squad dashboard (it starts with sandbox_sk_).' });
-        return false;
-    }
-    if (!isSandbox && secret.startsWith('sandbox_sk_')) {
-        res.status(503).json({ error: 'Squad live configuration is invalid. Use the live secret key with the production Squad API URL.' });
-        return false;
-    }
-    if (isSandbox || secret.startsWith('sk_')) return true;
-    res.status(503).json({ error: 'Squad secret key format is invalid.' });
-    return false;
-}
-
-function isSquadWebhookSignatureValid(req) {
-    const signature = (req.headers['x-squad-encrypted-body'] || req.headers['x-squad-signature'] || '').toString().trim();
-    const secret = (process.env.SQUAD_SECRET_KEY || '').trim();
-
-    // The signature is over the exact bytes received from Squad. Never fall
-    // back to JSON.stringify here: re-serializing changes whitespace/order and
-    // could make an invalid request appear valid.
-    if (!signature || !secret || !Buffer.isBuffer(req.rawBody)) return false;
-
-    const digest = crypto.createHmac('sha512', secret).update(req.rawBody).digest('hex');
-    if (signature.length !== digest.length) return false;
-
-    try {
-        return crypto.timingSafeEqual(Buffer.from(signature, 'utf8'), Buffer.from(digest, 'utf8'));
-    } catch (_) {
-        return false;
     }
 }
 
@@ -668,22 +616,29 @@ function sendApiError(res, error, fallbackMessage = 'Server error. Please try ag
     return res.status(status).json(payload);
 }
 
+// Auth requests are the most likely to be retried (forgotten passwords, typo'd
+// usernames), and production traffic reaches this API through shared reverse
+// proxies (Netlify → Railway). A plain per-IP limiter with a low cap would let
+// a handful of failed attempts from one shared proxy IP lock out every visitor
+// behind it. Key by "username + IP" instead so each account gets its own
+// allowance regardless of the proxy, and do not count successful logins or
+// registrations against the limit.
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 15,
-    message: { error: "Too many attempts from this IP, please try again after 15 minutes." }
+    limit: 30,
+    keyGenerator: (req) => {
+        const username = (req.body && typeof req.body.username === 'string' ? req.body.username : '').trim().toLowerCase();
+        const ipKey = rateLimit.ipKeyGenerator(req.ip || '0.0.0.0');
+        return username ? `auth:${username}:${ipKey}` : `auth:ip:${ipKey}`;
+    },
+    skipSuccessfulRequests: true,
+    message: { error: "Too many attempts, please try again after 15 minutes." }
 });
 
 const actionLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100,
     message: { error: "Too many requests, please slow down." }
-});
-
-const webhookLimiter = rateLimit({
-    windowMs: 1 * 60 * 1000,
-    max: 300,
-    message: "Too many requests"
 });
 
 // ==========================================
@@ -841,36 +796,6 @@ db.serialize(() => {
         { name: 'reviewed_at', type: 'DATETIME' }
     ];
     depositColumnsToAdd.forEach((col) => addColumnIfMissing('deposits', col.name, col.type));
-    db.run(`CREATE TABLE IF NOT EXISTS squad_transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT,
-        user_id INTEGER,
-        email TEXT,
-        amount REAL,
-        reference TEXT UNIQUE,
-        payment_link TEXT,
-        status TEXT DEFAULT 'pending',
-        provider_reference TEXT,
-        payload TEXT,
-        processed_at DATETIME,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
-
-    const squadTransactionColumns = [
-        { name: 'username', type: 'TEXT' },
-        { name: 'user_id', type: 'INTEGER' },
-        { name: 'email', type: 'TEXT' },
-        { name: 'amount', type: 'REAL' },
-        { name: 'reference', type: 'TEXT' },
-        { name: 'payment_link', type: 'TEXT' },
-        { name: 'status', type: 'TEXT' },
-        { name: 'provider_reference', type: 'TEXT' },
-        { name: 'payload', type: 'TEXT' },
-        { name: 'processed_at', type: 'DATETIME' },
-        { name: 'created_at', type: 'DATETIME' }
-    ];
-    squadTransactionColumns.forEach((col) => addColumnIfMissing('squad_transactions', col.name, col.type));
-    db.run("UPDATE squad_transactions SET status = 'pending' WHERE status IS NULL OR TRIM(status) = ''");
 
     // ✅ UPDATED withdrawals table with all required columns
     db.run(`CREATE TABLE IF NOT EXISTS withdrawals (
@@ -1051,7 +976,6 @@ db.serialize(() => {
     db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_claims_user_date ON daily_claims(LOWER(username), claim_date)');
     db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_sponsored_submissions_post_user ON sponsored_submissions(post_id, LOWER(username))');
     db.run('CREATE INDEX IF NOT EXISTS idx_deposits_transaction_ref ON deposits(transaction_ref)');
-    db.run('CREATE INDEX IF NOT EXISTS idx_squad_transactions_reference ON squad_transactions(reference)');
 
     db.run(`CREATE TABLE IF NOT EXISTS investment_packages (
         id TEXT PRIMARY KEY,
@@ -1459,76 +1383,6 @@ app.post('/api/login', authLimiter, async (req, res) => {
     }
 });
 
-async function createSquadDepositLink(req, res) {
-    try {
-        if (!ensureSquadConfigured(res)) return;
-
-        const body = req.body && typeof req.body === 'object' ? req.body : {};
-        const { amount, email, user_id } = body;
-        if (!isValidAmount(amount) || !isValidEmail(email) || user_id === undefined || user_id === null) {
-            return res.status(400).json({ error: "Amount, email, and user_id are required" });
-        }
-        if (Number(user_id) !== Number(req.user.id)) {
-            return res.status(403).json({ error: 'Invalid user_id for authenticated account.' });
-        }
-
-        const normalizedAmount = toFiniteNumber(amount);
-        const amountInKobo = Math.round(normalizedAmount * 100);
-        const reference = `AW-DEPOSIT-${Date.now()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
-        const squadPaymentLinkUrl = `${getSquadApiUrl().replace(/\/$/, '')}/transaction/initiate`;
-        const callbackUrl = process.env.SQUAD_CALLBACK_URL || 'https://accesswealthhq.com/dashboard';
-
-        const payload = {
-            email: email.trim(),
-            amount: amountInKobo,
-            currency: 'NGN',
-            initiate_type: 'inline',
-            transaction_ref: reference,
-            callback_url: callbackUrl,
-            metadata: {
-                username: req.user.username,
-                user_id: req.user.id,
-                source: 'accesswealth_deposit'
-            }
-        };
-
-        let squadResponse;
-        try {
-            squadResponse = await axios.post(squadPaymentLinkUrl, payload, {
-                headers: {
-                    Authorization: `Bearer ${process.env.SQUAD_SECRET_KEY}`,
-                    'Content-Type': 'application/json'
-                },
-                timeout: 30000
-            });
-        } catch (apiError) {
-            const reason = apiError.response?.data?.message || apiError.message;
-            return res.status(502).json({ error: `Failed to initialize Squad payment link: ${reason}` });
-        }
-
-        const responseData = squadResponse.data || {};
-        const dataNode = responseData.data || responseData;
-        const checkoutUrl = dataNode.checkout_url || dataNode.payment_link || dataNode.url || null;
-        const providerReference = dataNode.transaction_ref || dataNode.reference || reference;
-
-        if (!checkoutUrl) {
-            return res.status(500).json({ error: 'Squad did not return a payment link.' });
-        }
-
-        await withSqliteBusyRetry(
-            () => dbRunAsync(
-                `INSERT INTO squad_transactions (username, user_id, email, amount, reference, payment_link, provider_reference, status)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
-                [req.user.username, req.user.id, email.trim(), normalizedAmount, reference, checkoutUrl, providerReference]
-            ),
-            'squad_transaction_insert'
-        );
-        return res.json({ success: true, checkout_url: checkoutUrl, payment_link: checkoutUrl, reference });
-    } catch (error) {
-        res.status(500).json({ error: 'Server error during Squad payment link initialization.' });
-    }
-}
-
 // POST /api/refresh-token — exchange a still-valid (or recently expired) token
 // for a fresh 30-day token and the full normalized user. The frontend should
 // call this when it receives a 401/403 with code TOKEN_INVALID, OR proactively
@@ -1579,120 +1433,7 @@ app.post('/api/refresh-token', actionLimiter, (req, res) => {
 });
 
 // ==========================================
-// 2. SQUAD AUTOMATED DEPOSITS
-// ==========================================
-app.post('/api/deposit', authenticateToken, actionLimiter, createSquadDepositLink);
-app.post('/api/squad/payment-link', authenticateToken, actionLimiter, createSquadDepositLink);
-
-app.get('/api/squad/transaction/:reference', authenticateToken, async (req, res) => {
-    const reference = (req.params.reference || '').trim();
-    if (!reference) return res.status(400).json({ error: 'Transaction reference is required.' });
-
-    try {
-        const transaction = await dbGetAsync(
-            `SELECT reference, amount, status, provider_reference, processed_at, created_at
-             FROM squad_transactions
-             WHERE reference = ? AND (LOWER(username) = LOWER(?) OR ? = 'admin')`,
-            [reference, req.user.username, req.user.role]
-        );
-
-        if (!transaction) return res.status(404).json({ error: 'Transaction not found.' });
-
-        const status = (transaction.status || 'pending').toLowerCase();
-        return res.json({
-            success: status === 'success',
-            status,
-            message: status === 'success'
-                ? 'Deposit credited successfully.'
-                : 'Your payment is still awaiting confirmation.',
-            transaction
-        });
-    } catch (error) {
-        console.error('Squad transaction lookup error:', error.message);
-        return res.status(500).json({ error: 'Unable to retrieve transaction status.' });
-    }
-});
-
-app.post('/api/squad/webhook', webhookLimiter, async (req, res) => {
-    try {
-        if (!process.env.SQUAD_SECRET_KEY) {
-            return res.status(503).send('Squad gateway is not configured.');
-        }
-
-        if (!isSquadWebhookSignatureValid(req)) {
-            console.warn(`Invalid Squad webhook signature from ${req.ip}`);
-            return res.status(401).send('Unauthorized');
-        }
-
-        const event = req.body || {};
-        const eventName = (event.event || event.Event || event.type || '').toString().toLowerCase();
-        const data = event.data || event;
-
-        if (!['charge_successful', 'transaction.successful', 'charge.successful'].includes(eventName)) {
-            return res.sendStatus(200);
-        }
-
-        const reference = (data.transaction_ref || data.reference || '').toString().trim();
-        if (!reference) {
-            return res.status(400).json({ error: 'Missing transaction reference in webhook payload.' });
-        }
-
-        const transaction = await dbGetAsync(`SELECT * FROM squad_transactions WHERE reference = ?`, [reference]);
-        if (!transaction) {
-            return res.status(404).json({ error: 'Transaction not found.' });
-        }
-
-        if ((transaction.status || '').toLowerCase() === 'success') {
-            return res.sendStatus(200);
-        }
-
-        const paidAmount = Number(data.amount || event.amount || 0) / 100;
-        if (!Number.isFinite(paidAmount) || paidAmount <= 0) {
-            return res.status(400).json({ error: 'Invalid amount in webhook payload.' });
-        }
-        if (Math.round(paidAmount * 100) !== Math.round(Number(transaction.amount) * 100)) {
-            console.warn(`Squad webhook amount mismatch for ${reference}`);
-            return res.status(400).json({ error: 'Webhook amount does not match the initiated transaction.' });
-        }
-
-        await dbRunAsync('BEGIN IMMEDIATE TRANSACTION');
-        try {
-            const updateTx = await dbRunAsync(
-                `UPDATE squad_transactions
-                 SET status = 'success', provider_reference = COALESCE(?, provider_reference), payload = ?, processed_at = datetime('now')
-                 WHERE reference = ? AND status = 'pending'`,
-                [(data.transaction_ref || data.reference || null), JSON.stringify(event), reference]
-            );
-
-            if (!updateTx.changes) {
-                await dbRunAsync('ROLLBACK');
-                return res.sendStatus(200);
-            }
-
-            const creditResult = await dbRunAsync(
-                `UPDATE users SET 
-                    balance = COALESCE(balance, 0) + ?,
-                    wallet_balance = COALESCE(wallet_balance, 0) + ?
-                 WHERE id = ?`,
-                [paidAmount, paidAmount, transaction.user_id]
-            );
-            if (!creditResult.changes) throw new Error('User not found for credited transaction.');
-
-            await dbRunAsync('COMMIT');
-        } catch (creditError) {
-            try { await dbRunAsync('ROLLBACK'); } catch (_) {}
-            throw creditError;
-        }
-
-        return res.sendStatus(200);
-    } catch (error) {
-        console.error('Squad webhook processing error:', error.message);
-        return res.status(500).json({ error: 'Webhook processing failed.' });
-    }
-});
-
-// ==========================================
-// 3. FIXED INVESTMENT PACKAGES
+// 2. FIXED INVESTMENT PACKAGES
 // ==========================================
 app.get('/api/packages', (req, res) => {
     db.all(
@@ -3016,9 +2757,7 @@ app.get('/api/admin/stats', authenticateToken, adminOnly, async (req, res) => {
         const [users, activePlans, revenue, pendingDeposits, pendingWithdrawals] = await Promise.all([
             dbGetAsync("SELECT COUNT(*) AS count FROM users"),
             dbGetAsync("SELECT COUNT(*) AS count FROM users WHERE LOWER(CAST(planActivated AS TEXT)) IN ('true', '1')"),
-            dbGetAsync(`SELECT
-                (SELECT COALESCE(SUM(amount), 0) FROM deposits WHERE status = 'approved')
-                + (SELECT COALESCE(SUM(amount), 0) FROM squad_transactions WHERE status = 'success') AS total`),
+            dbGetAsync(`SELECT COALESCE(SUM(amount), 0) AS total FROM deposits WHERE status = 'approved'`),
             dbGetAsync("SELECT COUNT(*) AS count FROM deposits WHERE status = 'pending'"),
             dbGetAsync("SELECT COUNT(*) AS count FROM withdrawals WHERE status IN ('pending', 'processing')")
         ]);
