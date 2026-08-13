@@ -445,6 +445,28 @@ function dbAllAsync(sql, params = []) {
     });
 }
 
+const {
+    CLAIM_COOLDOWN_MS,
+    resolveActiveEntitlement,
+    serializeUserWithEntitlement,
+    extractAccessToken,
+    buildTokenPayload,
+    nextClaimAtFrom,
+    parseSqliteDate,
+    serializeActiveInvestment
+} = require('./entitlement').createEntitlementHelpers({
+    dbGetAsync,
+    dbAllAsync,
+    FIXED_PACKAGES,
+    PACKAGE_BY_ID,
+    PACKAGE_BY_NAME,
+    toFiniteNumber,
+    isTrueFlag,
+    serializeUser,
+    signAccessToken,
+    getReferralBonus
+});
+
 // Read a feature/site setting with a safe fallback. Settings are stored as
 // strings in SQLite, and callers use the callback form so they can return a
 // clean API error if the database is unavailable. Keeping this helper central
@@ -1200,11 +1222,19 @@ app.get(['/', '/api'], (req, res) => {
     });
 });
 
+function sendInvalidToken(res, err) {
+    const expired = Boolean(err && (err.name === 'TokenExpiredError' || /expired/i.test(String(err.message || ''))));
+    return res.status(401).json({
+        error: "Invalid or expired token. Please log in again.",
+        code: "TOKEN_INVALID",
+        expired
+    });
+}
+
 const authenticateToken = (req, res, next) => {
     if (!requireJwtSecret(res)) return;
 
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
+    const token = extractAccessToken(req);
     if (!token) return res.status(401).json({ error: "Access token required", code: "TOKEN_MISSING" });
 
     // First try the strict verification (issuer + audience) used by current
@@ -1217,12 +1247,7 @@ const authenticateToken = (req, res, next) => {
     jwt.verify(token, jwtSecret, verifyOptions, (err, user) => {
         if (err) {
             jwt.verify(token, jwtSecret, {}, (legacyErr, legacyUser) => {
-                if (legacyErr) {
-                    return res.status(403).json({
-                        error: "Invalid or expired token. Please log in again.",
-                        code: "TOKEN_INVALID"
-                    });
-                }
+                if (legacyErr) return sendInvalidToken(res, legacyErr);
                 req.user = legacyUser;
                 return validateUserStatus(req, res, next);
             });
@@ -1237,7 +1262,7 @@ function validateUserStatus(req, res, next) {
     db.get(`SELECT status FROM users WHERE id = ?`, [req.user.id], (statusErr, statusRow) => {
         if (statusErr) return res.status(500).json({ error: "Server error while validating account status" });
         if (!statusRow) {
-            return res.status(403).json({ error: "Invalid or expired token. Please log in again.", code: "TOKEN_INVALID" });
+            return res.status(401).json({ error: "Invalid or expired token. Please log in again.", code: "TOKEN_INVALID" });
         }
         if (String(statusRow.status || '').toLowerCase() === 'banned') {
             return res.status(403).json({ error: "Your account has been suspended. Please contact support." });
@@ -1258,7 +1283,7 @@ app.post('/api/user/sync', authenticateToken, async (req, res) => {
     try {
         const user = await dbGetAsync(`SELECT * FROM users WHERE LOWER(username) = LOWER(?)`, [req.user.username]);
         if (!user) return res.status(404).json({ error: "User not found" });
-        return res.json({ success: true, user: serializeUser(user) });
+        return res.json({ success: true, user: await serializeUserWithEntitlement(user) });
     } catch (error) {
         return sendApiError(res, error, 'Unable to synchronize user profile.');
     }
@@ -1309,20 +1334,19 @@ app.post('/api/register', authLimiter, async (req, res) => {
             [username, hashedPassword, myReferralId, normalizedReferredBy]
         );
         const userId = insertResult.lastID;
-        const token = signAccessToken({ id: userId, username, role: 'user' });
         const newUser = await dbGetAsync(`SELECT * FROM users WHERE id = ?`, [userId]);
+        const serialized = await serializeUserWithEntitlement(newUser || {
+            id: userId,
+            username,
+            role: 'user',
+            status: 'active',
+            my_referral_id: myReferralId
+        });
 
         return res.json({
-            success: true,
+            ...buildTokenPayload(newUser || { id: userId, username, role: 'user' }),
             message: "Registration successful!",
-            token,
-            user: serializeUser(newUser || {
-                id: userId,
-                username,
-                role: 'user',
-                status: 'active',
-                my_referral_id: myReferralId
-            })
+            user: serialized
         });
     } catch (error) {
         console.error('Registration error:', error.message);
@@ -1390,11 +1414,9 @@ app.post('/api/login', authLimiter, async (req, res) => {
             return res.status(400).json({ error: "Invalid username or password" });
         }
 
-        const token = signAccessToken(user);
         return res.json({
-            success: true,
-            token,
-            user: serializeUser(user)
+            ...buildTokenPayload(user),
+            user: await serializeUserWithEntitlement(user)
         });
     } catch (error) {
         // Keep database/bcrypt/JWT failures inside the request lifecycle. The
@@ -1415,8 +1437,7 @@ app.post('/api/login', authLimiter, async (req, res) => {
 app.post('/api/refresh-token', actionLimiter, (req, res) => {
     if (!requireJwtSecret(res)) return;
 
-    const authHeader = req.headers['authorization'];
-    const incomingToken = authHeader && authHeader.split(' ')[1];
+    const incomingToken = extractAccessToken(req);
     if (!incomingToken) {
         return res.status(401).json({ error: "Access token required", code: "TOKEN_MISSING" });
     }
@@ -1430,25 +1451,25 @@ app.post('/api/refresh-token', actionLimiter, (req, res) => {
             if (String(user.status || '').toLowerCase() === 'banned') {
                 return res.status(403).json({ error: "Your account has been suspended. Please contact support." });
             }
-            const freshToken = signAccessToken(user);
-            return res.json({ success: true, token: freshToken, user: serializeUser(user) });
+            return res.json({
+                ...buildTokenPayload(user),
+                user: await serializeUserWithEntitlement(user)
+            });
         } catch (error) {
             console.error('Token refresh error:', error.message);
             return sendApiError(res, error, 'Unable to refresh your session. Please log in again.');
         }
     };
 
-    // Try strict verification first.
     jwt.verify(incomingToken, jwtSecret, { issuer: JWT_ISSUER, audience: JWT_AUDIENCE }, (err, payload) => {
         if (!err) return finishWithUser(payload);
 
-        // Allow grace period for an expired-but-otherwise-valid token.
         jwt.verify(incomingToken, jwtSecret, { ignoreExpiration: true }, (legacyErr, legacyPayload) => {
             if (legacyErr) {
-                return res.status(403).json({ error: "Session expired. Please log in again.", code: "TOKEN_INVALID" });
+                return res.status(401).json({ error: "Session expired. Please log in again.", code: "TOKEN_INVALID" });
             }
-            if (legacyPayload.exp && (Date.now() / 1000 - legacyPayload.exp) > 7 * 24 * 60 * 60) {
-                return res.status(403).json({ error: "Session expired. Please log in again.", code: "TOKEN_INVALID" });
+            if (legacyPayload.exp && (Date.now() / 1000 - legacyPayload.exp) > 30 * 24 * 60 * 60) {
+                return res.status(401).json({ error: "Session expired. Please log in again.", code: "TOKEN_INVALID" });
             }
             finishWithUser(legacyPayload);
         });
@@ -1618,27 +1639,14 @@ app.post('/api/activate', authenticateToken, actionLimiter, async (req, res) => 
 // the frontend calculate the cost of upgrading to a higher package.
 app.get('/api/active-investment', authenticateToken, async (req, res) => {
     try {
-        const investment = await dbGetAsync(
-            `SELECT id, package_id, package_name, capital, daily_rate, cycle_days,
-                    daily_earning, total_payout, referral_bonus, days_credited,
-                    status, activated_at, completed_at
-             FROM user_investments
-             WHERE user_id = ? AND status = 'active'
-             ORDER BY activated_at DESC
-             LIMIT 1`,
-            [req.user.id]
-        );
-
-        const user = await dbGetAsync(
-            `SELECT balance, wallet_balance, planActivated, activePackage, activePackageId
-             FROM users WHERE id = ?`,
-            [req.user.id]
-        );
+        const user = await dbGetAsync(`SELECT * FROM users WHERE id = ?`, [req.user.id]);
+        const entitlement = await resolveActiveEntitlement(user || { id: req.user.id, username: req.user.username });
+        const investment = serializeActiveInvestment(entitlement);
 
         res.json({
             success: true,
-            hasActive: !!investment,
-            investment: investment || null,
+            hasActive: Boolean(investment),
+            investment,
             balance: user ? (user.wallet_balance ?? user.balance ?? 0) : 0
         });
     } catch (error) {
@@ -1976,7 +1984,7 @@ app.get('/api/user/:username', authenticateToken, async (req, res) => {
             [requestedUsername]
         );
         if (!user) return res.status(404).json({ error: "User not found" });
-        return res.json({ success: true, user: serializeUser(user) });
+        return res.json({ success: true, user: await serializeUserWithEntitlement(user) });
     } catch (error) {
         return sendApiError(res, error, 'Unable to load user profile.');
     }
@@ -2337,40 +2345,61 @@ app.post('/api/claim-daily-task', authenticateToken, actionLimiter, async (req, 
     const claimDate = getClaimDate();
 
     try {
-        const activeInvestment = await dbGetAsync(
-            `SELECT daily_earning
-             FROM user_investments
-             WHERE user_id = ? AND status = 'active'
-             ORDER BY activated_at DESC LIMIT 1`,
-            [userId]
-        );
-        const amount = activeInvestment ? toFiniteNumber(activeInvestment.daily_earning) : null;
-        if (amount === null || amount <= 0) {
-            return res.status(403).json({ error: "You must activate a valid package first." });
+        const userRecord = await dbGetAsync(`SELECT * FROM users WHERE id = ?`, [userId]);
+        if (!userRecord) return res.status(404).json({ error: 'User not found.' });
+
+        const entitlement = await resolveActiveEntitlement(userRecord);
+        const amount = entitlement ? toFiniteNumber(entitlement.daily_earning) : null;
+        if (!entitlement || amount === null || amount <= 0) {
+            return res.status(403).json({
+                error: 'Activate your account',
+                code: 'PLAN_REQUIRED'
+            });
         }
 
         const result = await withSqliteTransaction(async () => {
             const user = await dbGetAsync(
-                `SELECT id, username, taskEarnings, planActivated
-                 FROM users WHERE id = ?`,
+                `SELECT id, username, taskEarnings FROM users WHERE id = ?`,
                 [userId]
             );
             if (!user) throw apiError(404, 'User not found.');
-            if (!isTrueFlag(user.planActivated)) throw apiError(403, 'You must activate a plan first.');
 
-            const existing = await dbGetAsync(
-                `SELECT id, amount FROM daily_claims
+            const lastClaim = await dbGetAsync(
+                `SELECT id, amount, claim_date, created_at FROM daily_claims
+                 WHERE LOWER(username) = LOWER(?)
+                 ORDER BY datetime(created_at) DESC, id DESC
+                 LIMIT 1`,
+                [username]
+            );
+            if (lastClaim) {
+                const lastClaimAt = parseSqliteDate(lastClaim.created_at);
+                if (lastClaimAt && (Date.now() - lastClaimAt.getTime()) < CLAIM_COOLDOWN_MS) {
+                    const duplicate = apiError(
+                        400,
+                        "You have already claimed your daily earnings. Please wait 24 hours.",
+                        'ALREADY_CLAIMED'
+                    );
+                    duplicate.claimedAmount = Number(lastClaim.amount || 0);
+                    duplicate.nextClaimAt = nextClaimAtFrom(lastClaimAt);
+                    throw duplicate;
+                }
+            }
+
+            const sameDay = await dbGetAsync(
+                `SELECT id, amount, created_at FROM daily_claims
                  WHERE LOWER(username) = LOWER(?) AND claim_date = ?
                  LIMIT 1`,
                 [username, claimDate]
             );
-            if (existing) {
+            if (sameDay) {
+                const sameDayAt = parseSqliteDate(sameDay.created_at) || new Date();
                 const duplicate = apiError(
                     400,
                     "You have already claimed your daily earnings today. Come back tomorrow!",
                     'ALREADY_CLAIMED'
                 );
-                duplicate.claimedAmount = Number(existing.amount || 0);
+                duplicate.claimedAmount = Number(sameDay.amount || 0);
+                duplicate.nextClaimAt = nextClaimAtFrom(sameDayAt);
                 throw duplicate;
             }
 
@@ -2392,12 +2421,15 @@ app.post('/api/claim-daily-task', authenticateToken, actionLimiter, async (req, 
              FROM users WHERE id = ?`,
             [userId]
         );
+        const nextClaimAt = nextClaimAtFrom();
 
         return res.json({
             success: true,
             message: `Successfully claimed ₦${amount.toLocaleString()}!`,
             claimed_amount: amount,
+            dailyEarning: amount,
             newBalance: result.newTaskEarnings,
+            next_claim_at: nextClaimAt,
             balances: refreshed ? {
                 balance: Number(refreshed.balance ?? 0),
                 wallet_balance: Number(refreshed.wallet_balance ?? 0),
@@ -2411,13 +2443,15 @@ app.post('/api/claim-daily-task', authenticateToken, actionLimiter, async (req, 
             return res.status(400).json({
                 error: error.message,
                 already_claimed: true,
-                claimed_amount: error.claimedAmount || 0
+                claimed_amount: error.claimedAmount || 0,
+                next_claim_at: error.nextClaimAt || nextClaimAtFrom()
             });
         }
         if (String(error?.message || '').includes('UNIQUE constraint failed') && String(error?.message || '').includes('daily_claims')) {
             return res.status(400).json({
                 error: "You have already claimed your daily earnings today. Come back tomorrow!",
-                already_claimed: true
+                already_claimed: true,
+                next_claim_at: nextClaimAtFrom()
             });
         }
         console.error('Claim daily task error:', error.message);
@@ -2824,172 +2858,11 @@ app.get('/api/admin/migrations/legacy-plans/status', authenticateToken, adminOnl
 });
 
 app.post('/api/admin/migrations/legacy-plans/run', authenticateToken, adminOnly, async (req, res) => {
-    const migrationKey = 'legacy_plan_reset_v1';
-    const fixedPackageIds = FIXED_PACKAGES.map((pkg) => pkg.id.toLowerCase());
-    const placeholders = fixedPackageIds.map(() => '?').join(', ');
-    const operator = req.user.username || 'admin';
-    let transactionOpen = false;
-
-    try {
-        await dbRunAsync('BEGIN IMMEDIATE TRANSACTION');
-        transactionOpen = true;
-
-        const existing = await dbGetAsync(
-            `SELECT migration_key, status FROM system_migrations WHERE migration_key = ?`,
-            [migrationKey]
-        );
-
-        if (existing && existing.status === 'completed') {
-            await dbRunAsync('ROLLBACK');
-            return res.status(409).json({ error: 'Legacy reset migration has already been completed.' });
-        }
-
-        if (existing && existing.status === 'running') {
-            await dbRunAsync('ROLLBACK');
-            return res.status(409).json({ error: 'Legacy reset migration is already running.' });
-        }
-
-        await dbRunAsync(
-            `INSERT INTO system_migrations (migration_key, status, started_by, notes, started_at, completed_at, updated_at)
-             VALUES (?, 'running', ?, ?, datetime('now'), NULL, datetime('now'))
-             ON CONFLICT(migration_key) DO UPDATE SET
-                status = 'running',
-                started_by = excluded.started_by,
-                notes = excluded.notes,
-                started_at = datetime('now'),
-                completed_at = NULL,
-                updated_at = datetime('now')`,
-            [migrationKey, operator, 'Started from admin dashboard']
-        );
-
-        const legacyPlans = await dbAllAsync(
-            `SELECT id, user_id, username, capital, daily_earning, total_payout, status, package_id
-             FROM user_investments
-             WHERE LOWER(COALESCE(status, '')) IN ('active', 'ongoing')
-               AND (
-                    package_id IS NULL OR TRIM(package_id) = ''
-                    OR LOWER(package_id) NOT IN (${placeholders})
-               )`,
-            fixedPackageIds
-        );
-
-        const impactedUserIds = new Set();
-        const impactedUsernames = new Set();
-        let refundedPlans = 0;
-        let refundedTotal = 0;
-
-        for (const plan of legacyPlans) {
-            const capital = Number(plan.capital || 0);
-            const refundableCapital = Number.isFinite(capital) && capital > 0 ? capital : 0;
-
-            if (refundableCapital > 0) {
-                if (plan.user_id) {
-                    await dbRunAsync(
-                        `UPDATE users SET 
-                            balance = COALESCE(balance, 0) + ?,
-                            wallet_balance = COALESCE(wallet_balance, 0) + ?
-                         WHERE id = ?`,
-                        [refundableCapital, refundableCapital, plan.user_id]
-                    );
-                    impactedUserIds.add(Number(plan.user_id));
-                } else if (plan.username) {
-                    await dbRunAsync(
-                        `UPDATE users SET 
-                            balance = COALESCE(balance, 0) + ?,
-                            wallet_balance = COALESCE(wallet_balance, 0) + ?
-                         WHERE LOWER(username) = LOWER(?)`,
-                        [refundableCapital, refundableCapital, plan.username]
-                    );
-                    impactedUsernames.add(String(plan.username));
-                }
-
-                refundedPlans += 1;
-                refundedTotal += refundableCapital;
-            }
-
-            await dbRunAsync(
-                `UPDATE user_investments
-                 SET status = 'cancelled_system_upgrade',
-                     days_credited = 0,
-                     daily_earning = 0,
-                     total_payout = capital,
-                     completed_at = datetime('now')
-                 WHERE id = ?`,
-                [plan.id]
-            );
-        }
-
-        for (const userId of impactedUserIds) {
-            await dbRunAsync(
-                `UPDATE users
-                 SET planActivated = 'false',
-                     activePackage = 'None',
-                     activePackageId = NULL,
-                     daily_earnings = 0
-                 WHERE id = ?`,
-                [userId]
-            );
-        }
-
-        for (const username of impactedUsernames) {
-            await dbRunAsync(
-                `UPDATE users
-                 SET planActivated = 'false',
-                     activePackage = 'None',
-                     activePackageId = NULL,
-                     daily_earnings = 0
-                 WHERE LOWER(username) = LOWER(?)`,
-                [username]
-            );
-        }
-
-        const notes = JSON.stringify({
-            refunded_plans: refundedPlans,
-            refunded_total: refundedTotal,
-            impacted_users_by_id: impactedUserIds.size,
-            impacted_users_by_username: impactedUsernames.size
-        });
-
-        await dbRunAsync(
-            `UPDATE system_migrations
-             SET status = 'completed', notes = ?, completed_at = datetime('now'), updated_at = datetime('now')
-             WHERE migration_key = ?`,
-            [notes, migrationKey]
-        );
-
-        await dbRunAsync('COMMIT');
-        transactionOpen = false;
-
-        res.json({
-            success: true,
-            message: 'Legacy reset migration completed successfully.',
-            summary: {
-                plans_cancelled: legacyPlans.length,
-                plans_refunded: refundedPlans,
-                total_refunded: refundedTotal,
-                impacted_users: impactedUserIds.size + impactedUsernames.size
-            }
-        });
-    } catch (error) {
-        if (transactionOpen) {
-            try { await dbRunAsync('ROLLBACK'); } catch (_) {}
-        }
-
-        try {
-            await dbRunAsync(
-                `INSERT INTO system_migrations (migration_key, status, started_by, notes, started_at, completed_at, updated_at)
-                 VALUES (?, 'failed', ?, ?, datetime('now'), NULL, datetime('now'))
-                 ON CONFLICT(migration_key) DO UPDATE SET
-                    status = 'failed',
-                    started_by = excluded.started_by,
-                    notes = excluded.notes,
-                    updated_at = datetime('now')`,
-                [migrationKey, operator, `Failed from admin endpoint: ${error.message}`]
-            );
-        } catch (_) {}
-
-        res.status(500).json({ error: `Legacy reset migration failed: ${error.message}` });
-    }
+    return res.status(403).json({
+        success: false,
+        error: 'Legacy plan reset is disabled. Existing active and legacy plans are preserved.',
+        code: 'LEGACY_RESET_DISABLED'
+    });
 });
 
 // ==========================================
@@ -3552,23 +3425,66 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
 const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Access Wealth API listening on port ${PORT}`);
-    console.log(`Startup summary -> NODE_ENV: ${process.env.NODE_ENV || 'development'} | Database: ${dbPath}`);
-    console.log(`Startup summary -> JWT_SECRET: ${jwtSecret ? 'configured' : 'NOT CONFIGURED (login/register return 503 until it is set)'}`);
-    if (configuredFrontendOrigins.length) {
-        console.log(`CORS configured for ${configuredFrontendOrigins.join(', ')}`);
-    } else {
-        console.log('CORS using the default Access Wealth frontend origins. Set FRONTEND_URL for a deployed frontend origin.');
-    }
-    processActiveInvestmentCycles();
-    setInterval(processActiveInvestmentCycles, 60 * 60 * 1000);
+
+
+let resolveDbReady;
+let rejectDbReady;
+const dbReady = new Promise((resolve, reject) => {
+    resolveDbReady = resolve;
+    rejectDbReady = reject;
 });
 
-// Bounds for slow/unreliable clients (notably mobile uploads). Without these a
-// stalled mobile upload could leave a request (and its in-memory body) hanging
-// indefinitely. The headers/request timeouts fail fast so the client can show an
-// error and retry instead of appearing to freeze or refresh.
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 70000;
-server.requestTimeout = 120000; // 2 minutes to allow large/slow receipt uploads
+db.get('SELECT 1 AS ready', [], (err) => {
+    if (err) {
+        console.error('Database readiness check failed:', err.message);
+        rejectDbReady(err);
+        return;
+    }
+    resolveDbReady();
+});
+
+function attachServerTimeouts(httpServer) {
+    httpServer.keepAliveTimeout = 65000;
+    httpServer.headersTimeout = 70000;
+    httpServer.requestTimeout = 120000;
+    return httpServer;
+}
+
+function startServer(port = PORT, host = '0.0.0.0') {
+    const httpServer = app.listen(port, host, () => {
+        const address = httpServer.address();
+        const listeningPort = address && typeof address === 'object' ? address.port : port;
+        console.log(`Access Wealth API listening on port ${listeningPort}`);
+        console.log(`Startup summary -> NODE_ENV: ${process.env.NODE_ENV || 'development'} | Database: ${dbPath}`);
+        console.log(`Startup summary -> JWT_SECRET: ${jwtSecret ? 'configured' : 'NOT CONFIGURED (login/register return 503 until it is set)'}`);
+        if (configuredFrontendOrigins.length) {
+            console.log(`CORS configured for ${configuredFrontendOrigins.join(', ')}`);
+        } else {
+            console.log('CORS using the default Access Wealth frontend origins. Set FRONTEND_URL for a deployed frontend origin.');
+        }
+        if (process.env.NODE_ENV !== 'test') {
+            processActiveInvestmentCycles();
+            setInterval(processActiveInvestmentCycles, 60 * 60 * 1000);
+        }
+    });
+    return attachServerTimeouts(httpServer);
+}
+
+if (require.main === module) {
+    startServer();
+}
+
+module.exports = {
+    app,
+    db,
+    dbReady,
+    startServer,
+    signAccessToken,
+    JWT_ISSUER,
+    JWT_AUDIENCE,
+    jwtSecret,
+    dbRunAsync,
+    dbGetAsync,
+    resolveActiveEntitlement,
+    serializeUserWithEntitlement
+};
