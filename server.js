@@ -249,6 +249,32 @@ app.use(express.json({
 app.use(express.urlencoded({ extended: false, limit: '100kb' }));
 
 // ==========================================
+// API ERROR ENVELOPE (offline-app contract)
+// ==========================================
+// The installed app (PWA/TWA) caches API responses and parses every error as
+// { "success": false, "error": "message" }. Guarantee that shape for ALL error
+// statuses from ANY /api/* handler — including rate limiters, body-parser
+// failures, multer errors and future routes — regardless of how the handler/
+// middleware phrased the payload. This is additive to every endpoint's
+// existing fields and never alters success responses or their shapes.
+app.use('/api', (req, res, next) => {
+    const originalJson = res.json.bind(res);
+    res.json = (body) => {
+        const status = res.statusCode;
+        if (status >= 400
+            && body !== null
+            && typeof body === 'object'
+            && !Array.isArray(body)
+            && !Buffer.isBuffer(body)
+            && !('success' in body)) {
+            return originalJson({ success: false, ...body });
+        }
+        return originalJson(body);
+    };
+    next();
+});
+
+// ==========================================
 // MANUAL PAYMENT CONFIGURATION
 // Deposits are handled manually: users transfer to this account and upload a
 // payment receipt for admin approval.
@@ -1227,8 +1253,11 @@ function bootstrapStaffAccount({ username, role, referralId, passwordEnv }) {
             }
             const hash = bcryptjs.hashSync(bootstrapPassword, 10);
             db.run(
-                `INSERT INTO users (username, password, role, my_referral_id, planActivated, activePackage, activePackageId)
-                 VALUES (?, ?, ?, ?, 'true', 'Elite Apex', 'elite_apex')`,
+                // status is set explicitly: this INSERT runs 500ms after the
+                // startup backfills, so an unset status would stay NULL until
+                // the next restart — and /api/admin/users guarantees a string.
+                `INSERT INTO users (username, password, role, my_referral_id, planActivated, activePackage, activePackageId, status)
+                 VALUES (?, ?, ?, ?, 'true', 'Elite Apex', 'elite_apex', 'active')`,
                 [username, hash, role, referralId],
                 (insertErr) => {
                     if (insertErr) console.error(`Failed to create ${role} account:`, insertErr.message);
@@ -2806,7 +2835,7 @@ app.post('/api/admin/clear-total-balance', authenticateToken, adminOnly, async (
 });
 
 app.get('/api/admin/users', authenticateToken, adminOnly, (req, res) => {
-    db.all(`SELECT id, username, balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance, planActivated, activePackage, activePackageId, role, status, created_at FROM users ORDER BY id DESC`, [], (err, rows) => {
+    db.all(`SELECT id, username, balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance, planActivated, activePackage, activePackageId, role, COALESCE(NULLIF(TRIM(status), ''), 'active') AS status, created_at FROM users ORDER BY id DESC`, [], (err, rows) => {
         if (err) return res.status(500).json({ error: "Database error" });
         res.json({ success: true, users: rows });
     });
@@ -3445,15 +3474,15 @@ async function processActiveInvestmentCycles() {
 // ==========================================
 app.use((err, req, res, next) => {
     if (err && err.type === 'entity.parse.failed') {
-        return res.status(400).json({ error: 'Request body must contain valid JSON.' });
+        return res.status(400).json({ success: false, error: 'Request body must contain valid JSON.' });
     }
     if (err && err.type === 'entity.too.large') {
-        return res.status(413).json({ error: 'Request body is too large.' });
+        return res.status(413).json({ success: false, error: 'Request body is too large.' });
     }
     if (res.headersSent) return next(err);
 
     console.error(`UNHANDLED ERROR:`, err && err.stack ? err.stack : err);
-    return res.status(500).json({ error: "Internal server error" });
+    return res.status(500).json({ success: false, error: "Internal server error" });
 });
 
 process.on('unhandledRejection', (reason) => {
@@ -3489,6 +3518,13 @@ function shutdown(signal) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// Unknown /api/* routes must answer JSON — the installed app parses every API
+// response. Express's default "Cannot GET ..." HTML page would crash the
+// client's parser and is indistinguishable from a maintenance-window HTML page.
+app.use('/api', (req, res) => {
+    res.status(404).json({ success: false, error: 'API endpoint not found.' });
+});
 
 // ==========================================
 // WEB APP (FRONTEND) — served from /public
