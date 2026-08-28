@@ -234,3 +234,18 @@ responses, cleared on sign-out. The backend cooperates as follows:
 The API itself never returns HTML. During host maintenance, infrastructure
 (Railway/proxy) may serve its own status page — the app must treat non-JSON or
 empty responses as "server unreachable", exactly like a network failure.
+
+## Health probe (offline banner & auto-resync)
+
+`GET /api/health` (and alias `/health`): **no auth, no rate limiting,
+always fresh.** Success is `200` with a tiny JSON body containing
+`status: "ok"` (extra diagnostic keys like `database` are additive).
+Degraded states answer `503` with `{ success:false, status:'error', ... }`.
+
+- The `status: "ok"` discriminator is frozen — the app drives its offline
+  banner from it: `200` + JSON `status:"ok"` ⇒ server up; timeout/5xx/non-JSON
+  ⇒ offline or down.
+- The response is marked `Cache-Control: no-store`, and **the service worker
+  must network-bypass `/api/health`** (add it to the never-cache list) —
+  serving a cached 200 while offline would hide an outage.
+- Per-call server work is a single `SELECT 1`; measured single-digit ms.

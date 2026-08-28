@@ -156,6 +156,41 @@ const ADMIN_WITHDRAWAL_ROW = {
 
 const OK_MESSAGE = { success: 'boolean', message: 'string' };
 
+/* ---------------- health probe ---------------- */
+
+test('GET /api/health: fast, 200, small JSON, no auth, never cached, never rate-limited', async () => {
+    // No auth header — must still be 200 with status:'ok'.
+    const res = await fetch(`${baseUrl}/api/health`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') || '', /application\/json/);
+    const body = await res.text();
+    assert.ok(body.length < 200, `health body must stay tiny, got ${body.length}b`);
+    const data = JSON.parse(body);
+    assert.equal(data.status, 'ok', "app keys liveness off status:'ok' — frozen");
+    // Liveness must never be served from a cache (a stale 200 masks outages).
+    assert.match((res.headers.get('cache-control') || '').toLowerCase(), /no-store/);
+
+    // Rate-limit exclusion: burst 60 requests, expect all 200.
+    const burst = await Promise.all(Array.from({ length: 60 }, () => fetch(`${baseUrl}/api/health`)));
+    for (const r of burst) assert.equal(r.status, 200, 'health must never be rate-limited');
+
+    // Speed: warm loop far under the 50ms budget for every call.
+    const timings = [];
+    for (let i = 0; i < 10; i += 1) {
+        const t0 = performance.now();
+        const r = await fetch(`${baseUrl}/api/health`);
+        timings.push(performance.now() - t0);
+        assert.equal(r.status, 200);
+    }
+    const slowest = Math.max(...timings);
+    assert.ok(slowest < 50, `health must stay under ~50ms locally; slowest was ${slowest.toFixed(1)}ms`);
+
+    // Bare /health alias behaves identically (infra probes use it).
+    const alias = await fetch(`${baseUrl}/health`);
+    assert.equal(alias.status, 200);
+    assert.equal((await alias.json()).status, 'ok');
+});
+
 /* ---------------- fixtures ---------------- */
 
 async function waitForSchema() {

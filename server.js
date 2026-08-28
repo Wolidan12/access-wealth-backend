@@ -1319,14 +1319,19 @@ function bootstrapStaffAccount({ username, role, referralId, passwordEnv }) {
 // Lightweight deployment probe. A frontend can distinguish "the API is down"
 // from a bad username/password, and Railway/other hosts can use this endpoint
 // as a health check without needing an auth token.
+// Liveness probe for load balancers AND the installed app's offline banner:
+// a 200 here means "server is up"; anything else (503/timeout/non-JSON) means
+// offline-or-down. no-store is essential — a cached 200 would mask an outage
+// and the app would suppress its offline banner while the server is down.
 app.get(['/health', '/api/health'], (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     db.get('SELECT 1 AS ok', [], (err) => {
         if (err) {
             console.error('Health check database error:', err.message);
-            return res.status(503).json({ status: 'error', database: 'unavailable' });
+            return res.status(503).json({ success: false, status: 'error', database: 'unavailable' });
         }
         if (!jwtSecret) {
-            return res.status(503).json({ status: 'error', database: 'ok', authentication: 'not_configured' });
+            return res.status(503).json({ success: false, status: 'error', database: 'ok', authentication: 'not_configured' });
         }
         return res.json({ status: 'ok', database: 'ok', authentication: 'ok' });
     });
