@@ -365,6 +365,8 @@ export async function renderAdminWithdrawals(root) {
                         ${w.status === 'pending' ? `
                             <button class="btn btn-sm btn-primary" data-approve="${w.id}">Approve</button>
                             <button class="btn btn-sm btn-danger" data-decline="${w.id}">Decline & refund</button>` : ''}
+                        ${w.status === 'processing' ? `
+                            <button class="btn btn-sm btn-primary" data-complete="${w.id}">✔ Mark as paid</button>` : ''}
                     </div>
                 </div>`;
             }).join('')}</div>`;
@@ -386,6 +388,7 @@ export async function renderAdminWithdrawals(root) {
     listEl.addEventListener('click', async (e) => {
         const approveBtn = e.target.closest('[data-approve]');
         const declineBtn = e.target.closest('[data-decline]');
+        const completeBtn = e.target.closest('[data-complete]');
 
         if (approveBtn) {
             const id = approveBtn.dataset.approve;
@@ -421,6 +424,20 @@ export async function renderAdminWithdrawals(root) {
                         }
                     }
                 ]
+            });
+        }
+
+        if (completeBtn) {
+            const id = completeBtn.dataset.complete;
+            confirmModal({
+                title: `Mark withdrawal #${id} as paid?`,
+                message: 'Only do this after the bank transfer to the member has been completed. The member gets a "Withdrawal paid" push and email immediately.',
+                confirmLabel: 'Mark as paid',
+                onConfirm: async () => {
+                    const data = await api('/api/admin/complete-withdrawal', { method: 'POST', body: { id: Number(id) } });
+                    toast(data.message || 'Withdrawal marked as paid.', 'success');
+                    await load();
+                }
             });
         }
     });

@@ -51,7 +51,7 @@ async function call(method, urlPath, { token, body, rawBody, headers = {} } = {}
     try { data = JSON.parse(text); } catch (_) {
         assert.fail(`${method} ${urlPath} → non-JSON body (contract forbids HTML): ${text.slice(0, 120)}`);
     }
-    return { status: res.status, data };
+    return { status: res.status, data, headers: res.headers };
 }
 
 // Pin exact field presence + JS type. '?' suffix = nullable (string? = string|null).
@@ -364,6 +364,14 @@ test('withdrawal request + history + pending + admin approve', async () => {
     const approve = await call('POST', '/api/admin/approve-withdrawal', { token: adminToken, body: { id: adminList.data.withdrawals[0].id } });
     assert.equal(approve.status, 200, JSON.stringify(approve.data));
     assertFields(approve.data, OK_MESSAGE, 'admin/approve-withdrawal');
+
+    // "Withdrawal paid" is its own event: processing → completed.
+    const complete = await call('POST', '/api/admin/complete-withdrawal', { token: adminToken, body: { id: adminList.data.withdrawals[0].id } });
+    assert.equal(complete.status, 200, JSON.stringify(complete.data));
+    assertFields(complete.data, OK_MESSAGE, 'admin/complete-withdrawal');
+
+    const after = await call('GET', '/api/user/withdrawals', { token: userToken });
+    assert.equal(after.data.withdrawals[0].status, 'completed', 'withdrawal should be completed after mark-as-paid');
 });
 
 /* ---------------- referrals ---------------- */
@@ -487,8 +495,36 @@ test('profile/bank/password + manual payment info + site settings', async () => 
     assertFields(upd.data, OK_MESSAGE, 'update-profile');
     const bank = await call('POST', '/api/user/update-bank', { token: userToken, body: { bank_name: 'Test Bank', account_number: '1234567890', account_holder: 'Contract User' } });
     assertFields(bank.data, OK_MESSAGE, 'update-bank');
+
+    // Bank masking contract: cacheable GETs only ever carry the masked number.
+    const maskedProfile = await call('GET', `/api/user/profile/${encodeURIComponent(USERNAME)}`, { token: userToken });
+    assert.equal(maskedProfile.data.profile.bank_account_number, '****7890', 'profile GET must mask the account number');
+    const syncMasked = await call('POST', '/api/user/sync', { token: userToken });
+    assert.equal(syncMasked.data.user.bank_account_number, '****7890', 'user/sync must mask the account number');
+    // "Keep saved number": blank account number must not wipe it.
+    const keep = await call('POST', '/api/user/update-bank', { token: userToken, body: { bank_name: 'Test Bank 2', account_number: '', account_holder: 'Contract User' } });
+    assert.equal(keep.status, 200, JSON.stringify(keep.data));
+    // Dedicated non-cacheable reveal endpoint returns the full number.
+    const reveal = await call('POST', '/api/user/reveal-bank', { token: userToken });
+    assert.equal(reveal.status, 200, JSON.stringify(reveal.data));
+    assertFields(reveal.data, { success: 'boolean', bank: 'object' }, 'reveal-bank');
+    assertFields(reveal.data.bank, { bank_name: 'string', bank_account_number: 'string', bank_account_holder: 'string' }, 'reveal-bank.bank');
+    assert.equal(reveal.data.bank.bank_account_number, '1234567890');
+    assert.equal(reveal.data.bank.bank_name, 'Test Bank 2');
+    assert.match((reveal.headers.get('cache-control') || '').toLowerCase(), /no-store/, 'reveal-bank must be no-store');
+
+    // Password change revokes every session in the family (epoch bump).
     const pw = await call('POST', '/api/user/change-password', { token: userToken, body: { current_password: PASSWORD, new_password: 'contract456' } });
     assertFields(pw.data, OK_MESSAGE, 'change-password');
+    const stale = await call('POST', '/api/user/sync', { token: userToken });
+    assert.equal(stale.status, 401, 'the pre-change token must be revoked after password change');
+    assert.equal(stale.data.code, 'TOKEN_INVALID');
+    const freshRefresh = await call('POST', '/api/refresh-token', { body: { token: userToken } });
+    assert.equal(freshRefresh.status, 401, 'refresh chain must also be revoked');
+    // Re-login with the new password so downstream tests have a valid token.
+    const relogin = await call('POST', '/api/login', { body: { username: USERNAME, password: 'contract456' } });
+    assert.equal(relogin.status, 200);
+    userToken = relogin.data.token;
 
     const pay = await call('GET', '/api/payment/manual-info');
     assertFields(pay.data, { success: 'boolean', payment: 'object' }, 'payment/manual-info');

@@ -3,6 +3,7 @@
 
 import { api } from '../api.js';
 import { store } from '../store.js';
+import { pushSupported, pushPermission, fetchVapidKey, getCurrentSubscription, enablePush, disablePush } from '../push.js';
 import {
     esc, fmtNaira, fmtNum, fmtPct, fmtDate, timeAgo, maskName, badge, tierBadge,
     toast, openModal, confirmModal, setBusy, skeletonCards, emptyState, copyToClipboard, fieldValue, fieldEl
@@ -594,18 +595,38 @@ export async function renderWithdraw(root) {
                             <input class="input" id="wd-amount" name="amount" type="number" min="3000" step="100" inputmode="numeric" placeholder="Min ₦3,000" required ${hasPending ? 'disabled' : ''} />
                             <div class="hint" id="wd-available"></div>
                         </div>
+                        ${user?.bank_complete ? `
+                        <div class="notice notice-success" id="wd-saved-bank">
+                            <span class="notice-ico">🏦</span>
+                            <p>Paying to <strong>${esc(user.bank_account_number)}</strong> · ${esc(user.bank_name)} · ${esc(user.bank_account_holder)}
+                            <br/><button class="btn btn-ghost btn-sm" id="wd-alt-toggle" type="button" style="padding-left:0">Use a different account</button></p>
+                        </div>
+                        <div id="wd-alt-fields" class="hide">
                         <div class="field">
                             <label for="wd-bank">Bank name</label>
-                            <input class="input" id="wd-bank" name="bank_name" type="text" value="${esc(user?.bank_name || '')}" placeholder="e.g. Moniepoint" />
+                            <input class="input" id="wd-bank" name="bank_name" type="text" placeholder="e.g. Moniepoint" />
                         </div>
                         <div class="field">
                             <label for="wd-acct">Account number</label>
-                            <input class="input" id="wd-acct" name="account_number" type="text" inputmode="numeric" value="${esc(user?.bank_account_number || '')}" placeholder="10-digit account number" />
+                            <input class="input" id="wd-acct" name="account_number" type="text" inputmode="numeric" placeholder="Full account number" autocomplete="off" />
                         </div>
                         <div class="field">
                             <label for="wd-holder">Account holder name</label>
-                            <input class="input" id="wd-holder" name="account_holder" type="text" value="${esc(user?.bank_account_holder || '')}" placeholder="Name on the account" />
+                            <input class="input" id="wd-holder" name="account_holder" type="text" placeholder="Name on the account" />
                         </div>
+                        </div>` : `
+                        <div class="field">
+                            <label for="wd-bank">Bank name</label>
+                            <input class="input" id="wd-bank" name="bank_name" type="text" placeholder="e.g. Moniepoint" />
+                        </div>
+                        <div class="field">
+                            <label for="wd-acct">Account number</label>
+                            <input class="input" id="wd-acct" name="account_number" type="text" inputmode="numeric" placeholder="10-digit account number" />
+                        </div>
+                        <div class="field">
+                            <label for="wd-holder">Account holder name</label>
+                            <input class="input" id="wd-holder" name="account_holder" type="text" placeholder="Name on the account" />
+                        </div>`}
                         <div class="field"><div class="error-text hide" id="wd-error" role="alert"></div></div>
                         <button class="btn btn-primary btn-block" type="submit" id="wd-btn" ${hasPending ? 'disabled' : ''}>Submit withdrawal request</button>
                     </form>
@@ -628,6 +649,19 @@ export async function renderWithdraw(root) {
     };
     fieldEl(form, 'wallet_type').addEventListener('change', updateAvailable);
     updateAvailable();
+
+    // Saved-bank mode: pay to the stored account without ever holding the
+    // full number client-side (backend resolves it). "Use a different account"
+    // reveals editable fields for a one-off payout to another account.
+    let useAltAccount = false;
+    const altToggle = root.querySelector('#wd-alt-toggle');
+    if (altToggle) {
+        altToggle.addEventListener('click', () => {
+            useAltAccount = !useAltAccount;
+            root.querySelector('#wd-alt-fields').classList.toggle('hide', !useAltAccount);
+            root.querySelector('#wd-saved-bank').classList.toggle('hide', useAltAccount);
+        });
+    }
 
     const renderHistory = (rows) => {
         const el = root.querySelector('#wd-history');
@@ -662,20 +696,26 @@ export async function renderWithdraw(root) {
             errEl.classList.remove('hide');
             return;
         }
-        const bank = fieldValue(form, 'bank_name').trim();
-        const acct = fieldValue(form, 'account_number').trim();
-        const holder = fieldValue(form, 'account_holder').trim();
-        if (!bank || !acct || !holder) {
-            errEl.textContent = 'Please fill in all bank details for this payout.';
-            errEl.classList.remove('hide');
-            return;
+        const body = { amount, wallet_type };
+        if (useAltAccount || !user?.bank_complete) {
+            const bank = fieldValue(form, 'bank_name').trim();
+            const acct = fieldValue(form, 'account_number').trim();
+            const holder = fieldValue(form, 'account_holder').trim();
+            if (!bank || !acct || !holder) {
+                errEl.textContent = 'Please fill in all bank details for this payout.';
+                errEl.classList.remove('hide');
+                return;
+            }
+            if (!/^\d{6,20}$/.test(acct)) {
+                errEl.textContent = 'Account number must contain 6 to 20 digits.';
+                errEl.classList.remove('hide');
+                return;
+            }
+            body.bank_details = { bank_name: bank, account_number: acct, account_holder: holder };
         }
         setBusy(btn, true, 'Submitting…');
         try {
-            const data = await api('/api/request-withdrawal', {
-                method: 'POST',
-                body: { amount, wallet_type, bank_details: { bank_name: bank, account_number: acct, account_holder: holder } }
-            });
+            const data = await api('/api/request-withdrawal', { method: 'POST', body });
             toast(data.message || 'Withdrawal submitted — awaiting approval.', 'success');
             renderWithdraw(root);
         } catch (err) {
@@ -781,7 +821,11 @@ export async function renderProfile(root) {
                         <div class="field"><label for="bk-name">Bank name</label>
                             <input class="input" id="bk-name" name="bank_name" value="${esc(user.bank_name || '')}" placeholder="e.g. Moniepoint" required /></div>
                         <div class="field"><label for="bk-acct">Account number</label>
-                            <input class="input" id="bk-acct" name="account_number" inputmode="numeric" value="${esc(user.bank_account_number || '')}" placeholder="6–20 digits" required /></div>
+                            <input class="input" id="bk-acct" name="account_number" inputmode="numeric" placeholder="${esc(user.bank_account_number || '6–20 digits')}" autocomplete="off" />
+                            ${user.bank_account_number
+                                ? `<div class="hint">Saved: <strong>${esc(user.bank_account_number)}</strong> — leave blank to keep it. For security, full numbers are only shown after verification.</div>`
+                                : '<div class="hint">6–20 digits, as on your bank app.</div>'}
+                        </div>
                         <div class="field"><label for="bk-holder">Account holder</label>
                             <input class="input" id="bk-holder" name="account_holder" value="${esc(user.bank_account_holder || '')}" placeholder="Name on the account" required /></div>
                         <button class="btn btn-primary" type="submit" id="bk-btn">Save bank details</button>
@@ -789,6 +833,10 @@ export async function renderProfile(root) {
                 </div>
             </div>
             <div class="stack">
+                <div class="card" id="notif-card">
+                    <div class="card-header"><h3>🔔 Notifications</h3></div>
+                    <div id="notif-body"><span class="small muted">Checking notification support…</span></div>
+                </div>
                 <div class="card">
                     <div class="card-header"><h3>Security</h3></div>
                     <form id="pw-form">
@@ -806,12 +854,62 @@ export async function renderProfile(root) {
                         <div class="row"><span>Referred by</span><span>${esc(maskName(user.referred_by || '')) || '—'}</span></div>
                         <div class="row"><span>Account role</span><span>${esc(user.role || 'user')}</span></div>
                         <div class="row"><span>Status</span><span>${badge(user.status || 'active')}</span></div>
+                        <div class="row"><span>Email verified</span><span>${user.email_verified ? '<span class="badge badge-approved">Verified</span>' : '<span class="badge badge-muted">Not verified</span>'}</span></div>
                     </div>
                     <hr class="divider" />
-                    <button class="btn btn-danger btn-block" id="logout-btn" type="button">Log out</button>
+                    <div class="stack-sm">
+                        <button class="btn btn-secondary btn-block" id="logout-all-btn" type="button">Log out of all devices</button>
+                        <button class="btn btn-danger btn-block" id="logout-btn" type="button">Log out</button>
+                    </div>
                 </div>
             </div>
         </div>`;
+
+    // Notifications card — enable/disable Web Push for this device.
+    const notifBody = root.querySelector('#notif-body');
+    const renderNotifCard = async () => {
+        if (!notifBody) return;
+        if (!pushSupported()) {
+            notifBody.innerHTML = `<p class="small mb-0 muted">This browser doesn't support push notifications. Install the app on Android or use a modern browser to get alerts.</p>`;
+            return;
+        }
+        let keyInfo = null;
+        try { keyInfo = await fetchVapidKey(); } catch (_) {}
+        if (!keyInfo || !keyInfo.enabled) {
+            notifBody.innerHTML = `<p class="small mb-0 muted">Push notifications are not enabled on the server yet.</p>`;
+            return;
+        }
+        if (pushPermission() === 'denied') {
+            notifBody.innerHTML = `<div class="notice notice-warning mb-0"><span class="notice-ico">🔕</span><p>Notifications are blocked in your browser settings. Allow them for this site to receive deposit and withdrawal alerts.</p></div>`;
+            return;
+        }
+        const sub = await getCurrentSubscription().catch(() => null);
+        if (sub) {
+            notifBody.innerHTML = `
+                <p class="mt-0">This device receives alerts for <strong>deposits approved</strong>, <strong>withdrawals paid</strong>, <strong>plan activation</strong> and <strong>announcements</strong>.</p>
+                <div class="flex"><span class="badge badge-active">Enabled on this device</span>
+                <button class="btn btn-secondary btn-sm" id="notif-off" type="button">Turn off</button></div>`;
+            notifBody.querySelector('#notif-off').addEventListener('click', async (e) => {
+                setBusy(e.target, true, 'Turning off…');
+                try { await disablePush(); toast('Notifications turned off on this device.', 'info'); }
+                catch (err) { toast(err.message, 'error'); }
+                renderNotifCard();
+            });
+        } else {
+            notifBody.innerHTML = `
+                <p class="mt-0">Get instant alerts for <strong>deposit approvals</strong>, <strong>paid withdrawals</strong>, <strong>plan activation</strong> and <strong>announcements</strong> — even when the app is closed.</p>
+                <button class="btn btn-accent" id="notif-on" type="button">🔔 Enable notifications</button>`;
+            notifBody.querySelector('#notif-on').addEventListener('click', async (e) => {
+                setBusy(e.target, true, 'Enabling…');
+                try {
+                    await enablePush();
+                    toast('Notifications enabled 🔔', 'success');
+                } catch (err) { toast(err.message, 'error'); }
+                renderNotifCard();
+            });
+        }
+    };
+    renderNotifCard();
 
     const bindSave = (formId, btnId, path, mapFields, successMsg) => {
         const form = root.querySelector(formId);
@@ -833,20 +931,57 @@ export async function renderProfile(root) {
         (f) => ({ full_name: fieldValue(f, 'full_name').trim(), phone: fieldValue(f, 'phone').trim() }), 'Profile saved');
     bindSave('#bank-form', '#bk-btn', '/api/user/update-bank',
         (f) => ({ bank_name: fieldValue(f, 'bank_name').trim(), account_number: fieldValue(f, 'account_number').trim(), account_holder: fieldValue(f, 'account_holder').trim() }), 'Bank details saved');
-    bindSave('#pw-form', '#pw-btn', '/api/user/change-password',
-        (f) => ({ current_password: fieldValue(f, 'current_password'), new_password: fieldValue(f, 'new_password') }), 'Password changed');
+    // Password change revokes every session (token epoch bump server-side) —
+    // so on success we must log this client out and send it to login.
+    const pwForm = root.querySelector('#pw-form');
+    const pwBtn = root.querySelector('#pw-btn');
+    pwForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        setBusy(pwBtn, true, 'Changing…');
+        try {
+            const data = await api('/api/user/change-password', {
+                method: 'POST',
+                body: { current_password: fieldValue(pwForm, 'current_password'), new_password: fieldValue(pwForm, 'new_password') }
+            });
+            toast(data.message || 'Password changed. Please log in again.', 'success', 6000);
+            store.clear();
+            location.hash = '#/login';
+        } catch (err) {
+            toast(err.message, 'error');
+            setBusy(pwBtn, false);
+        }
+    });
 
     root.querySelector('#logout-btn').addEventListener('click', () => {
         confirmModal({
             title: 'Log out?',
-            message: 'You will need your password to log back in.',
+            message: 'You will be signed out on this device only.',
             confirmLabel: 'Log out',
             onConfirm: async () => {
+                api('/api/logout', { method: 'POST' }).catch(() => {});
                 store.clear();
                 location.hash = '#/login';
             }
         });
     });
+
+    const logoutAllBtn = root.querySelector('#logout-all-btn');
+    if (logoutAllBtn) {
+        logoutAllBtn.addEventListener('click', () => {
+            confirmModal({
+                title: 'Log out of all devices?',
+                message: 'Every signed-in session — including installed apps on other phones — will be signed out. You can log back in with your password.',
+                confirmLabel: 'Log out everywhere',
+                danger: true,
+                onConfirm: async () => {
+                    await api('/api/user/logout-all', { method: 'POST' });
+                    store.clear();
+                    location.hash = '#/login';
+                    toast('All sessions signed out.', 'success');
+                }
+            });
+        });
+    }
 }
 
 /* ================= SUPPORT CHAT ================= */

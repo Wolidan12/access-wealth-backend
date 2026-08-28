@@ -4,6 +4,7 @@
 import { api, setSessionExpiredHandler } from './api.js';
 import { store } from './store.js';
 import { esc, fmtNaira, toast, initials } from './ui.js';
+import { resyncPushIfGranted } from './push.js';
 import { renderLanding, renderLogin, renderRegister } from './views/auth.js';
 import {
     renderDashboard, renderPlans, renderDeposit, renderWithdraw,
@@ -272,6 +273,7 @@ async function boot() {
         try {
             const data = await api('/api/user/sync', { method: 'POST' });
             if (data.user) store.setUser(data.user);
+            resyncPushIfGranted(); // re-register push subscription if previously allowed
         } catch (_) { /* api client already handles refresh/logout */ }
     }
 

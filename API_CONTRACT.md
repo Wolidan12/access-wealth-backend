@@ -229,6 +229,85 @@ responses, cleared on sign-out. The backend cooperates as follows:
    is added, these paths MUST NOT move.
 
 
+## Web Push (PWA/TWA notifications)
+
+`GET /api/push/vapid-public-key` (public) → `{ success:boolean,
+enabled:boolean, publicKey:string|null }`. When `enabled:false` the app hides
+its notification toggle.
+
+`POST /api/push/subscribe` (auth) — body `{ endpoint, keys:{p256dh,auth} }` or
+`{ subscription:{...} }`; upserts by endpoint (browser key rotation is normal)
+→ `{ success:true, message:string }`.
+
+`DELETE /api/push/subscribe`, `DELETE /api/push/unsubscribe`,
+`POST /api/push/unsubscribe` (auth) — body or `?endpoint=` →
+`{ success:true, message:string, removed:number }`. All three paths frozen.
+
+Push payloads are JSON `{ title:string, body:string, url:string, event:string }`,
+url is an app route: `/dashboard.html` (money events), `/plans.html` (plan
+events), `/announcements.html` (broadcasts). Events: `deposit_approved`,
+`withdrawal_paid` (fires on admin "mark as paid", i.e.
+`POST /api/admin/complete-withdrawal` — never at mere approval),
+`plan_activated`, `plan_upgraded`, `broadcast`. Subscriptions that return
+404/410 from the push service are pruned automatically.
+
+**Nigeria quiet hours: 23:00–07:00 Africa/Lagos.** Money-critical events
+(deposit approved, withdrawal paid, plan activation/upgrade) push immediately
+at any hour. Broadcasts during quiet hours are queued and delivered at 07:00.
+Pinned by `tests/push.contract.test.js`.
+
+## Sessions: rotation, revocation, throttling
+
+- Access tokens stay as they are (30d TTL) and rotate via
+  `POST /api/refresh-token` (+ accept ≤7 days past expiry) — the app's
+  auto-refresh keeps working unchanged.
+- Every token carries an `ep` (epoch) claim. `POST /api/user/logout-all`
+  (auth) → `{ success:true, message }` and password change / password reset
+  bump the epoch, revoking the whole session family: installed apps fail
+  refresh (401 TOKEN_INVALID) and route to login.
+- Login/register/forgot/reset are limited by BOTH a username+IP limiter
+  (30/15min, so office/estate NAT users don't lock each other out) and a
+  per-account limiter (8/15min keyed by account only, so IP-rotating
+  credential stuffing against one account dies). Successful attempts are not
+  counted.
+
+## Bank details masking
+
+`GET` responses and `POST /api/user/sync` never contain a full account number:
+it arrives masked as `****8934` (empty string when unset). The full value is
+available only via `POST /api/user/reveal-bank` (auth, non-cacheable:
+`Cache-Control: no-store`) → `{ success:true, bank:{ bank_name:string,
+bank_account_number:string, bank_account_holder:string } }`.
+`POST /api/user/update-bank` treats a blank or still-masked `account_number`
+as "keep the saved number". `POST /api/request-withdrawal` falls back to the
+saved bank details when `bank_details` is omitted or contains the mask.
+Admin withdrawal rows keep the full details (admin APIs are never cached).
+
+## Transactional email
+
+Sender module: `mailer.js`. Enabled when `SMTP_*` are set, or
+`MAIL_TRANSPORT=json` for render-only dev/tests; otherwise all sends are
+skipped safely and forgot/reset-password answer the honest 501 stub
+(`code: PASSWORD_RESET_UNAVAILABLE`). Events wired: welcome (register),
+password reset code, email verification code, deposit approved, withdrawal
+paid, plan activated, plan upgraded.
+
+`POST /api/forgot-password` { username } → always 200
+`{ success:true, message:"If that account exists, a reset code is on its way." }`
+(anti-enumeration) — issues a 6-digit code (15 min, single use) by email when
+the username is an email. `POST /api/reset-password` { username, code,
+new_password } → 200 `{ success:true, message }`; resets the password and bumps
+the session epoch. Without mail: both 501 JSON.
+`POST /api/email/request-verification` (auth) and `POST /api/email/verify`
+(auth, `{ code }`) → `{ success:true, message }`; sets `user.email_verified`.
+
+**Every template ends with the app-install footer block:** deep-blue band
+`#112A46`, gold button `#d4af37` with dark text `#0b1421`, linking to
+`https://accesswealthhq.com/login.html`, copy: "Open on your phone and choose
+Install app — works offline." When the Play listing is live, the single
+`GET_APP_URL` constant in `mailer.js` swaps to
+`https://play.google.com/store/apps/details?id=com.accesswealthhq.app`.
+
 ## Maintenance windows
 
 The API itself never returns HTML. During host maintenance, infrastructure
