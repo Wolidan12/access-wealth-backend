@@ -57,7 +57,11 @@ function signAccessToken(user) {
         throw new Error('JWT_SECRET is not configured');
     }
     return jwt.sign(
-        { id: user.id, username: user.username, role: user.role || 'user' },
+        // ep = the account's session epoch. Installed apps persist sessions for
+        // weeks via /api/refresh-token; bumping users.token_epoch (password
+        // change, "log out all sessions") invalidates every token in the
+        // family — including offline devices — which is the intended behavior.
+        { id: user.id, username: user.username, role: user.role || 'user', ep: Number(user.token_epoch) || 0 },
         jwtSecret,
         { expiresIn: ACCESS_TOKEN_TTL, issuer: JWT_ISSUER, audience: JWT_AUDIENCE }
     );
@@ -76,6 +80,20 @@ function requireJwtSecret(res) {
 // sync endpoints. Earlier versions returned a partial object on login (missing
 // full_name, phone, bank details and the earnings wallets), which made the
 // frontend treat fully-activated users as having an "incomplete account".
+// Bank/account numbers are never emitted in full on cacheable reads. The
+// installed app keeps offline copies of GET responses — masking (****8934)
+// is the safe default; the full number is only available via the dedicated,
+// non-cacheable POST /api/user/reveal-bank.
+function maskAccountNumber(value) {
+    const digits = String(value || '').trim();
+    if (!digits) return '';
+    return `****${digits.slice(-4)}`;
+}
+
+function isMaskedAccountNumber(value) {
+    return /\*/.test(String(value || ''));
+}
+
 function serializeUser(user) {
     if (!user) return null;
     const walletBalance = toFiniteNumber(user.wallet_balance ?? user.balance) ?? 0;
@@ -103,7 +121,7 @@ function serializeUser(user) {
         full_name: user.full_name || '',
         phone: user.phone || '',
         bank_name: user.bank_name || '',
-        bank_account_number: user.bank_account_number || '',
+        bank_account_number: maskAccountNumber(user.bank_account_number),
         bank_account_holder: user.bank_account_holder || '',
         balance: toFiniteNumber(user.balance) ?? 0,
         wallet_balance: walletBalance,
@@ -113,7 +131,8 @@ function serializeUser(user) {
         // Convenience flags the dashboard uses to decide what to prompt for.
         profile_complete: profileComplete,
         bank_complete: bankComplete,
-        account_complete: profileComplete && bankComplete
+        account_complete: profileComplete && bankComplete,
+        email_verified: isTrueFlag(user.email_verified)
     };
 }
 
@@ -136,6 +155,8 @@ const DEFAULT_FRONTEND_ORIGINS = [
     'https://www.accesswealthhq.com',
     'http://localhost:3000',
     'http://127.0.0.1:3000',
+    'http://localhost:4173',
+    'http://127.0.0.1:4173',
     'http://localhost:5500',
     'http://127.0.0.1:5500',
     'http://localhost:5173',
@@ -182,10 +203,30 @@ const configuredFrontendOrigins = (process.env.FRONTEND_URL || '')
     .split(',')
     .map(normalizeOrigin)
     .filter(Boolean);
+// FRONTEND_URL extends the known-good defaults; it must never shrink the
+// allowlist. Setting FRONTEND_URL on a deploy previously *replaced* the
+// defaults, so every forgotten hostname (e.g. the www alias or a dev port)
+// silently lost CORS access. Union keeps configuration additive and safe.
 const allowedOrigins = new Set(
-    (configuredFrontendOrigins.length ? configuredFrontendOrigins : DEFAULT_FRONTEND_ORIGINS)
+    [...DEFAULT_FRONTEND_ORIGINS, ...configuredFrontendOrigins]
         .flatMap(getOriginAliases)
 );
+
+// Deploy-preview hosts: stable, narrowly-scoped shapes for this project only —
+// never a wildcard. Anything else belongs in FRONTEND_URL (exact origin).
+const DEPLOY_PREVIEW_ORIGIN_PATTERNS = [
+    // Arena/e2b sandbox preview proxies, e.g. https://3000-<sandbox-id>.e2b.app
+    /^https:\/\/\d{2,5}-[a-z0-9]+\.e2b\.app$/i,
+    // Railway preview deployments of this service, e.g.
+    // https://access-wealth-backend-pr-12.up.railway.app
+    /^https:\/\/[a-z0-9-]*access-?wealth[a-z0-9-]*\.up\.railway\.app$/i
+];
+
+function isAllowedOrigin(normalizedOrigin) {
+    if (!normalizedOrigin) return false;
+    if (allowedOrigins.has(normalizedOrigin)) return true;
+    return DEPLOY_PREVIEW_ORIGIN_PATTERNS.some((pattern) => pattern.test(normalizedOrigin));
+}
 const allowAnyDevelopmentOrigin = !isProduction &&
     String(process.env.NODE_ENV || '').toLowerCase() === 'development';
 
@@ -196,7 +237,7 @@ app.use(cors({
         if (!origin) return callback(null, true);
 
         const normalizedOrigin = normalizeOrigin(origin);
-        if (allowAnyDevelopmentOrigin || allowedOrigins.has(normalizedOrigin)) {
+        if (allowAnyDevelopmentOrigin || isAllowedOrigin(normalizedOrigin)) {
             return callback(null, true);
         }
 
@@ -207,7 +248,11 @@ app.use(cors({
         console.warn(`Blocked CORS request from ${origin}. Add this origin to FRONTEND_URL if it is the deployed frontend.`);
         return callback(null, false);
     },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    // Everything the PWA/TWA/API client sends. PATCH is required: admin/user
+    // update endpoints accept it, and a missing method in the preflight would
+    // surface to the app as an opaque "Network error" instead of the real
+    // JSON error body.
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true
 }));
@@ -221,6 +266,63 @@ app.use(express.json({
 // Accept traditional form posts as well as JSON. This keeps the auth endpoint
 // compatible with simple HTML/mobile clients without changing the JSON API.
 app.use(express.urlencoded({ extended: false, limit: '100kb' }));
+
+// ==========================================
+// API ERROR ENVELOPE (offline-app contract)
+// ==========================================
+// The installed app (PWA/TWA) caches API responses and parses every error as
+// { "success": false, "error": "message" }. Guarantee that shape for ALL error
+// statuses from ANY /api/* handler — including rate limiters, body-parser
+// failures, multer errors and future routes — regardless of how the handler/
+// middleware phrased the payload. This is additive to every endpoint's
+// existing fields and never alters success responses or their shapes.
+app.use('/api', (req, res, next) => {
+    const originalJson = res.json.bind(res);
+    res.json = (body) => {
+        const status = res.statusCode;
+        if (status >= 400
+            && body !== null
+            && typeof body === 'object'
+            && !Array.isArray(body)
+            && !Buffer.isBuffer(body)
+            && !('success' in body)) {
+            return originalJson({ success: false, ...body });
+        }
+        return originalJson(body);
+    };
+    next();
+});
+
+// ==========================================
+// CACHE POLICY (offline-app contract)
+// ==========================================
+// The installed app's service worker keeps last-known-good copies of GET JSON
+// responses (cleared on sign-out). Rules encoded here:
+//   (1) read endpoints the app mirrors offline (/api/user/sync, /api/packages,
+//       /api/active-investment, /api/referral/*, /api/tasks*, /api/broadcasts,
+//       /api/payment/manual-info) must stay cacheable — we never send
+//       no-store/no-cache on them;
+//   (2) sensitive payloads (money movements, PII, messages) carry
+//       Cache-Control: no-store — correct HTTP semantics regardless of client;
+//       they also match the app's never-cache list;
+//   (3) tokens/balances never appear in query strings — auth is the
+//       Authorization header only, by design.
+const SENSITIVE_GET_PATTERNS = [
+    /^\/api\/admin(\/|$)/,        // all admin data
+    /^\/api\/support(\/|$)/,       // support inbox listings
+    /^\/api\/chat(\/|$)/,          // private support threads
+    /^\/api\/user(\/|$)/,          // member PII: profile, withdrawals, receipts
+    /^\/api\/my-deposits$/,        // financial history
+    /^\/api\/sponsored-submission-status\// // per-user task/money state
+];
+
+app.use((req, res, next) => {
+    if ((req.method === 'GET' || req.method === 'HEAD')
+        && SENSITIVE_GET_PATTERNS.some((pattern) => pattern.test(req.path))) {
+        res.setHeader('Cache-Control', 'no-store');
+    }
+    next();
+});
 
 // ==========================================
 // MANUAL PAYMENT CONFIGURATION
@@ -467,6 +569,62 @@ const {
     getReferralBonus
 });
 
+// Web Push (VAPID) service — subscriptions, event pushes, quiet-hours queue,
+// dead-endpoint pruning. Disabled gracefully when VAPID keys are unset.
+const pushService = require('./push').createPushService({
+    dbRunAsync,
+    dbAllAsync,
+    dbGetAsync,
+    // Test-only clock hook for deterministic quiet-hours assertions.
+    now: () => (process.env.NODE_ENV === 'test' && process.env.PUSH_NOW_OVERRIDE
+        ? new Date(process.env.PUSH_NOW_OVERRIDE)
+        : new Date())
+});
+
+// Transactional email (welcome / verification / password reset / approvals /
+// plan activation). Env-gated: SMTP_* or MAIL_TRANSPORT=json; otherwise all
+// sends are skipped with a log line and never fail a request.
+const mailerModule = require('./mailer');
+const mailer = mailerModule.createMailer();
+const isLikelyEmail = mailerModule.isLikelyEmail;
+const renderEmail = mailerModule.renderEmail;
+const escapeEmailHtml = mailerModule.escapeHtml;
+
+function sendMailFireAndForget(to, subject, templateInput) {
+    if (!mailer.enabled || !isLikelyEmail(to)) return;
+    try {
+        const { html, text } = renderEmail(templateInput);
+        mailer.send({ to, subject, html, text })
+            .catch((error) => console.error(`[mail] "${subject}" failed for ${to}:`, error.message));
+    } catch (error) {
+        console.error(`[mail] render failed for "${subject}":`, error.message);
+    }
+}
+
+// One-time email codes (verification + password reset). SQLite datetimes are UTC.
+async function issueEmailCode(username, purpose, ttlMinutes = 15) {
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+    await dbRunAsync(`DELETE FROM email_codes WHERE username = ? AND purpose = ?`, [username, purpose]);
+    await dbRunAsync(
+        `INSERT INTO email_codes (username, purpose, code, expires_at) VALUES (?, ?, ?, datetime('now', ?))`,
+        [username, purpose, code, `+${ttlMinutes} minutes`]
+    );
+    return code;
+}
+
+async function consumeEmailCode(username, purpose, code) {
+    const row = await dbGetAsync(
+        `SELECT id, expires_at FROM email_codes
+         WHERE username = ? AND purpose = ? AND code = ? AND used_at IS NULL`,
+        [username, purpose, String(code || '').trim()]
+    );
+    if (!row) return false;
+    const expiry = new Date(String(row.expires_at).replace(' ', 'T') + 'Z');
+    if (Number.isNaN(expiry.getTime()) || expiry < new Date()) return false;
+    await dbRunAsync(`UPDATE email_codes SET used_at = datetime('now') WHERE id = ?`, [row.id]);
+    return true;
+}
+
 // Read a feature/site setting with a safe fallback. Settings are stored as
 // strings in SQLite, and callers use the callback form so they can return a
 // clean API error if the database is unavailable. Keeping this helper central
@@ -663,6 +821,24 @@ const actionLimiter = rateLimit({
     message: { error: "Too many requests, please slow down." }
 });
 
+// Per-ACCOUNT throttle — layered ON TOP of authLimiter (username+IP). Reason:
+// the username+IP limiter alone keeps Lagos office/estate NAT users from
+// locking each other out, but it cannot stop credential-stuffing that rotates
+// IPs against one account. This account-keyed dimension caps attempts per
+// account regardless of source IP. Wins in both directions.
+const authAccountLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 8,
+    keyGenerator: (req) => {
+        const username = (req.body && typeof req.body.username === 'string' ? req.body.username : '').trim().toLowerCase();
+        if (username) return `account:${username}`;
+        return `account-ip:${rateLimit.ipKeyGenerator(req.ip || '0.0.0.0')}`;
+    },
+    skipSuccessfulRequests: true,
+    standardHeaders: true,
+    message: { error: "Too many attempts on this account. Please wait 15 minutes or reset the password via Support." }
+});
+
 // ==========================================
 // DATABASE INITIALIZATION WITH MIGRATION
 // ==========================================
@@ -757,7 +933,9 @@ db.serialize(() => {
         { name: 'bank_account_holder', type: 'TEXT' },
         { name: 'bank_code', type: 'TEXT' },
         { name: 'created_at', type: 'DATETIME' },
-        { name: 'status', type: 'TEXT' }
+        { name: 'status', type: 'TEXT' },
+        { name: 'token_epoch', type: 'INTEGER' },
+        { name: 'email_verified', type: 'TEXT' }
     ];
 
     // Backfill values for columns added to an older database. These statements
@@ -772,7 +950,10 @@ db.serialize(() => {
         ["UPDATE users SET activePackage = 'None' WHERE activePackage IS NULL OR TRIM(activePackage) = ''", []],
         ["UPDATE users SET role = 'user' WHERE role IS NULL OR TRIM(role) = ''", []],
         ["UPDATE users SET status = 'active' WHERE status IS NULL OR TRIM(status) = ''", []],
-        ["UPDATE users SET created_at = datetime('now') WHERE created_at IS NULL", []]
+        ["UPDATE users SET created_at = datetime('now') WHERE created_at IS NULL", []],
+        // Session epoch drives "log out all sessions"/password-change revocation.
+        ["UPDATE users SET token_epoch = 0 WHERE token_epoch IS NULL", []],
+        ["UPDATE users SET email_verified = 'false' WHERE email_verified IS NULL OR TRIM(email_verified) = ''", []]
     ];
 
     columnsToAdd.forEach((col) => addColumnIfMissing('users', col.name, col.type));
@@ -921,6 +1102,22 @@ db.serialize(() => {
         target_username TEXT NOT NULL,
         action TEXT NOT NULL,
         details TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    // Web Push subscription storage + quiet-hours deferred queue.
+    require('./push').SCHEMA_STATEMENTS.forEach((sql) =>
+        db.run(sql, (err) => { if (err) console.error('[push] schema init failed:', err.message); })
+    );
+
+    // One-time email codes (email verification + password reset).
+    db.run(`CREATE TABLE IF NOT EXISTS email_codes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT,
+        purpose TEXT,
+        code TEXT,
+        expires_at DATETIME,
+        used_at DATETIME,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
@@ -1201,8 +1398,11 @@ function bootstrapStaffAccount({ username, role, referralId, passwordEnv }) {
             }
             const hash = bcryptjs.hashSync(bootstrapPassword, 10);
             db.run(
-                `INSERT INTO users (username, password, role, my_referral_id, planActivated, activePackage, activePackageId)
-                 VALUES (?, ?, ?, ?, 'true', 'Elite Apex', 'elite_apex')`,
+                // status is set explicitly: this INSERT runs 500ms after the
+                // startup backfills, so an unset status would stay NULL until
+                // the next restart — and /api/admin/users guarantees a string.
+                `INSERT INTO users (username, password, role, my_referral_id, planActivated, activePackage, activePackageId, status)
+                 VALUES (?, ?, ?, ?, 'true', 'Elite Apex', 'elite_apex', 'active')`,
                 [username, hash, role, referralId],
                 (insertErr) => {
                     if (insertErr) console.error(`Failed to create ${role} account:`, insertErr.message);
@@ -1233,14 +1433,19 @@ function bootstrapStaffAccount({ username, role, referralId, passwordEnv }) {
 // Lightweight deployment probe. A frontend can distinguish "the API is down"
 // from a bad username/password, and Railway/other hosts can use this endpoint
 // as a health check without needing an auth token.
+// Liveness probe for load balancers AND the installed app's offline banner:
+// a 200 here means "server is up"; anything else (503/timeout/non-JSON) means
+// offline-or-down. no-store is essential — a cached 200 would mask an outage
+// and the app would suppress its offline banner while the server is down.
 app.get(['/health', '/api/health'], (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     db.get('SELECT 1 AS ok', [], (err) => {
         if (err) {
             console.error('Health check database error:', err.message);
-            return res.status(503).json({ status: 'error', database: 'unavailable' });
+            return res.status(503).json({ success: false, status: 'error', database: 'unavailable' });
         }
         if (!jwtSecret) {
-            return res.status(503).json({ status: 'error', database: 'ok', authentication: 'not_configured' });
+            return res.status(503).json({ success: false, status: 'error', database: 'ok', authentication: 'not_configured' });
         }
         return res.json({ status: 'ok', database: 'ok', authentication: 'ok' });
     });
@@ -1251,7 +1456,9 @@ app.get(['/health', '/api/health'], (req, res) => {
 // return HTML instead. This makes a misconfigured custom domain (frontend and
 // API swapped, or /api not routed to this service) obvious instead of looking
 // like a network error on every login attempt.
-app.get(['/', '/api'], (req, res) => {
+// '/' intentionally falls through to the static app shell (public/index.html);
+// the service-info JSON remains available at '/api' for API consumers.
+app.get('/api', (req, res) => {
     res.json({
         service: 'Access Wealth API',
         status: 'running',
@@ -1297,10 +1504,17 @@ const authenticateToken = (req, res, next) => {
 };
 
 function validateUserStatus(req, res, next) {
-    db.get(`SELECT status FROM users WHERE id = ?`, [req.user.id], (statusErr, statusRow) => {
+    db.get(`SELECT status, token_epoch FROM users WHERE id = ?`, [req.user.id], (statusErr, statusRow) => {
         if (statusErr) return res.status(500).json({ error: "Server error while validating account status" });
         if (!statusRow) {
             return res.status(401).json({ error: "Invalid or expired token. Please log in again.", code: "TOKEN_INVALID" });
+        }
+        // Session-family revocation: tokens minted before a password change or
+        // "log out all sessions" carry a stale epoch and must not authenticate.
+        const tokenEpoch = Number(req.user.ep) || 0;
+        const accountEpoch = Number(statusRow.token_epoch) || 0;
+        if (tokenEpoch !== accountEpoch) {
+            return res.status(401).json({ error: "Your session has ended on all devices. Please log in again.", code: "TOKEN_INVALID" });
         }
         if (String(statusRow.status || '').toLowerCase() === 'banned') {
             return res.status(403).json({ error: "Your account has been suspended. Please contact support." });
@@ -1327,7 +1541,7 @@ app.post('/api/user/sync', authenticateToken, async (req, res) => {
     }
 });
 
-app.post('/api/register', authLimiter, async (req, res) => {
+app.post('/api/register', authLimiter, authAccountLimiter, async (req, res) => {
     if (!requireJwtSecret(res)) return;
 
     try {
@@ -1381,6 +1595,18 @@ app.post('/api/register', authLimiter, async (req, res) => {
             my_referral_id: myReferralId
         });
 
+        // Welcome email (fire-and-forget; only when username is an email).
+        sendMailFireAndForget(username, 'Welcome to Access Wealth HQ', {
+            title: 'Welcome to Access Wealth HQ',
+            greeting: `Hi ${escapeEmailHtml(username)},`,
+            paragraphs: [
+                'Your account is ready. Fund your wallet by bank transfer, activate a package, and start claiming daily earnings.',
+                `Your personal referral code is <strong>${escapeEmailHtml(myReferralId)}</strong> — share it to earn referral bonuses when your friends activate their packages.`,
+                'Questions? Use the in-app Support chat and an agent will help.'
+            ],
+            cta: { label: 'Open your dashboard', url: 'https://accesswealthhq.com/login.html' }
+        });
+
         return res.json({
             ...buildTokenPayload(newUser || { id: userId, username, role: 'user' }),
             message: "Registration successful!",
@@ -1398,7 +1624,7 @@ app.post('/api/register', authLimiter, async (req, res) => {
     }
 });
 
-app.post('/api/login', authLimiter, async (req, res) => {
+app.post('/api/login', authLimiter, authAccountLimiter, async (req, res) => {
     if (!requireJwtSecret(res)) return;
 
     try {
@@ -1486,6 +1712,11 @@ app.post('/api/refresh-token', actionLimiter, (req, res) => {
             if (!user) {
                 return res.status(401).json({ error: "Account no longer exists.", code: "TOKEN_INVALID" });
             }
+            // Refresh is part of the session family: a bumped epoch (password
+            // change / log-out-all) permanently kills the rotating chain.
+            if ((Number(payload.ep) || 0) !== (Number(user.token_epoch) || 0)) {
+                return res.status(401).json({ error: "Your session has ended on all devices. Please log in again.", code: "TOKEN_INVALID" });
+            }
             if (String(user.status || '').toLowerCase() === 'banned') {
                 return res.status(403).json({ error: "Your account has been suspended. Please contact support." });
             }
@@ -1512,6 +1743,94 @@ app.post('/api/refresh-token', actionLimiter, (req, res) => {
             finishWithUser(legacyPayload);
         });
     });
+});
+
+// POST /api/logout — JWTs are stateless Bearer tokens: the installed app
+// discards its token and clears its offline cache on sign-out. This endpoint
+// exists so the app's sign-out action has a stable, always-JSON server
+// contract (hard-bypassed from offline caching) and a future hook for a token
+// denylist without moving paths. It always succeeds, with or without a token.
+app.post('/api/logout', actionLimiter, (req, res) => {
+    res.json({ success: true, message: 'Logged out.' });
+});
+
+// POST /api/user/logout-all — bumps the account's token epoch, revoking the
+// WHOLE session family: installed apps on other phones fail their next
+// refresh and route to login, exactly like a web sign-out everywhere flow.
+app.post('/api/user/logout-all', authenticateToken, actionLimiter, async (req, res) => {
+    try {
+        const result = await dbRunAsync(
+            `UPDATE users SET token_epoch = COALESCE(token_epoch, 0) + 1 WHERE id = ?`,
+            [req.user.id]
+        );
+        if (!result.changes) return res.status(404).json({ error: 'User not found.' });
+        return res.json({ success: true, message: 'Logged out of all devices.' });
+    } catch (error) {
+        return sendApiError(res, error, 'Unable to end other sessions.');
+    }
+});
+
+// POST /api/forgot-password — issues a 6-digit reset code by email when mail
+// delivery is configured (SMTP_* or MAIL_TRANSPORT). Paths are frozen (the
+// app hard-bypasses them from offline caching). Response never reveals whether
+// the account exists. Without mail configured the honest 501 stub stays.
+const PASSWORD_RESET_UNAVAILABLE = 'Password reset is not available yet. Please open Support chat in the app and an agent will verify you and reset your password.';
+app.post('/api/forgot-password', authLimiter, authAccountLimiter, async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const username = typeof body.username === 'string' ? body.username.trim() : '';
+    if (!username) return res.status(400).json({ error: 'Enter your account email or username.' });
+    if (!mailer.enabled) {
+        return res.status(501).json({ error: PASSWORD_RESET_UNAVAILABLE, code: 'PASSWORD_RESET_UNAVAILABLE' });
+    }
+    // Anti-enumeration: identical response whether or not the account exists.
+    res.json({ success: true, message: 'If that account exists, a reset code is on its way.' });
+    try {
+        if (!isLikelyEmail(username)) return; // non-email usernames cannot receive mail
+        const user = await dbGetAsync(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [username]);
+        if (!user) return;
+        const code = await issueEmailCode(username, 'reset');
+        sendMailFireAndForget(username, 'Your Access Wealth password reset code', {
+            title: 'Reset your password',
+            greeting: 'Hello,',
+            paragraphs: [
+                'We received a request to reset your Access Wealth HQ password. Enter this code in the app within 15 minutes:',
+                'If you did not request this, you can ignore this email — your password stays unchanged.'
+            ],
+            highlight: code
+        });
+    } catch (error) {
+        console.error('[mail] forgot-password flow failed:', error.message);
+    }
+});
+
+app.post('/api/reset-password', authLimiter, authAccountLimiter, async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const username = typeof body.username === 'string' ? body.username.trim() : '';
+    const code = typeof body.code === 'string' ? body.code.trim() : '';
+    const newPassword = typeof body.new_password === 'string' ? body.new_password : '';
+    if (!mailer.enabled) {
+        return res.status(501).json({ error: PASSWORD_RESET_UNAVAILABLE, code: 'PASSWORD_RESET_UNAVAILABLE' });
+    }
+    if (!username || !/^\d{6}$/.test(code) || newPassword.length < 6) {
+        return res.status(400).json({ error: 'Username, the 6-digit code, and a new password (min 6 characters) are required.' });
+    }
+    try {
+        const user = await dbGetAsync(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [username]);
+        const valid = user ? await consumeEmailCode(username, 'reset', code) : false;
+        if (!user || !valid) {
+            return res.status(400).json({ error: 'Invalid or expired reset code.' });
+        }
+        const hashed = await bcryptjs.hash(newPassword, 10);
+        await dbRunAsync(
+            // Reset also revokes all existing sessions (token epoch bump) so a
+            // hijacker's installed app is signed out along with everyone else.
+            `UPDATE users SET password = ?, token_epoch = COALESCE(token_epoch, 0) + 1 WHERE id = ?`,
+            [hashed, user.id]
+        );
+        return res.json({ success: true, message: 'Password updated. Please log in with your new password.' });
+    } catch (error) {
+        return sendApiError(res, error, 'Unable to reset the password.');
+    }
 });
 
 // ==========================================
@@ -1660,6 +1979,21 @@ app.post('/api/activate', authenticateToken, actionLimiter, async (req, res) => 
             return { newBalance };
         }, 'activate_package');
 
+        // Fire-and-forget: push delivery must never slow or fail a money route.
+        pushService.notifyUser(
+            req.user.username,
+            'plan_activated',
+            `Your ${selectedPackage.name} package is now active. Daily earning: ₦${selectedPackage.daily_earning.toLocaleString()}.`
+        ).catch((error) => console.warn('[push] plan_activated send failed:', error.message));
+        sendMailFireAndForget(req.user.username, 'Plan activated — Access Wealth HQ', {
+            title: `${selectedPackage.name} is now active`,
+            greeting: `Hi there,`,
+            paragraphs: [
+                `Your <strong>${selectedPackage.name}</strong> package has been activated. Daily earning: <strong>₦${selectedPackage.daily_earning.toLocaleString()}</strong> for ${selectedPackage.cycle_days} days.`,
+                'Claim your daily earning from the Dashboard each day.'
+            ]
+        });
+
         return res.json({
             success: true,
             message: `Package ${selectedPackage.name} activated successfully.`,
@@ -1802,6 +2136,21 @@ app.post('/api/upgrade-package', authenticateToken, actionLimiter, async (req, r
         }, 'upgrade_package');
 
         console.warn(`[UPGRADE] ${req.user.username} upgraded to ${targetPackage.name} (cost ₦${result.upgradeCost})`);
+        // Fire-and-forget: push delivery must never slow or fail a money route.
+        pushService.notifyUser(
+            req.user.username,
+            'plan_upgraded',
+            `You're now on ${targetPackage.name}. Daily earning: ₦${targetPackage.daily_earning.toLocaleString()}.`
+        ).catch((error) => console.warn('[push] plan_upgraded send failed:', error.message));
+        sendMailFireAndForget(req.user.username, 'Plan upgraded — Access Wealth HQ', {
+            title: `You're now on ${targetPackage.name}`,
+            greeting: 'Hi there,',
+            paragraphs: [
+                `Your upgrade to <strong>${targetPackage.name}</strong> is complete. Daily earning: <strong>₦${targetPackage.daily_earning.toLocaleString()}</strong> for ${targetPackage.cycle_days} days.`,
+                'Your previous cycle has closed and the new one started immediately.'
+            ]
+        });
+
         return res.json({
             success: true,
             message: `Successfully upgraded to ${targetPackage.name}. ₦${result.upgradeCost.toLocaleString()} was deducted from your wallet.`,
@@ -1847,7 +2196,27 @@ app.post('/api/request-withdrawal', authenticateToken, actionLimiter, async (req
         const bankDetails = body.bank_details && typeof body.bank_details === 'object'
             ? body.bank_details
             : {};
-        const bankDetailsStr = JSON.stringify(bankDetails);
+        // The app only ever holds the MASKED account number (GET masking
+        // contract). If the client omitted details or echoed the mask back,
+        // fall back to the member's saved bank details instead of persisting
+        // a masked placeholder.
+        const saved = await dbGetAsync(
+            `SELECT bank_name, bank_account_number, bank_account_holder FROM users WHERE LOWER(username) = LOWER(?)`,
+            [username]
+        );
+        const masked = isMaskedAccountNumber(bankDetails.account_number);
+        const effective = {
+            bank_name: (typeof bankDetails.bank_name === 'string' && bankDetails.bank_name.trim())
+                ? bankDetails.bank_name.trim() : (saved ? saved.bank_name : ''),
+            account_number: (!masked && typeof bankDetails.account_number === 'string' && bankDetails.account_number.trim())
+                ? bankDetails.account_number.trim() : (saved ? saved.bank_account_number : ''),
+            account_holder: (typeof bankDetails.account_holder === 'string' && bankDetails.account_holder.trim())
+                ? bankDetails.account_holder.trim() : (saved ? saved.bank_account_holder : '')
+        };
+        if (!effective.bank_name || !effective.account_number || !effective.account_holder) {
+            return res.status(400).json({ error: 'Add your bank details on the Profile page before withdrawing.' });
+        }
+        const bankDetailsStr = JSON.stringify(effective);
 
         await withSqliteTransaction(async () => {
             const existing = await dbGetAsync(
@@ -1986,6 +2355,59 @@ app.post('/api/admin/decline-withdrawal', authenticateToken, adminOnly, async (r
     }
 });
 
+// Admin: mark a processing withdrawal as PAID (money actually sent to the
+// member's bank). This is the true "withdrawal paid" event — the push fires
+// here, not at approval, so the notification is never premature.
+app.post('/api/admin/complete-withdrawal', authenticateToken, adminOnly, async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const id = body.id;
+    const note = typeof body.note === 'string' ? body.note.trim().slice(0, 500) : '';
+    if (!id) return res.status(400).json({ error: 'Withdrawal ID required' });
+
+    try {
+        const result = await dbRunAsync(
+            `UPDATE withdrawals
+             SET status = 'completed', admin_note = ?, reviewed_by = ?, reviewed_at = datetime('now')
+             WHERE id = ? AND status = 'processing'`,
+            [note || 'Withdrawal paid.', req.user.username, id]
+        );
+        if (!result.changes) {
+            return res.status(409).json({ error: 'Withdrawal not found or not in processing state.' });
+        }
+        const withdrawal = await dbGetAsync(`SELECT username, amount FROM withdrawals WHERE id = ?`, [id]);
+        try {
+            await recordAdminAction(req.user.username, withdrawal ? withdrawal.username : null, 'withdrawal_complete', {
+                withdrawalId: id,
+                amount: withdrawal ? withdrawal.amount : null
+            });
+        } catch (auditError) {
+            console.warn('Complete-withdrawal audit log failed:', auditError.message);
+        }
+
+        console.warn(`[ADMIN] Withdrawal ${id} marked as paid by ${req.user.username}`);
+        if (withdrawal) {
+            // Fire-and-forget: money-critical, pushes immediately even overnight.
+            pushService.notifyUser(
+                withdrawal.username,
+                'withdrawal_paid',
+                `₦${Number(withdrawal.amount).toLocaleString()} has been paid to your bank account.`
+            ).catch((error) => console.warn('[push] withdrawal_paid send failed:', error.message));
+            sendMailFireAndForget(withdrawal.username, 'Withdrawal paid — Access Wealth HQ', {
+                title: 'Your withdrawal has been paid',
+                greeting: `Hi ${escapeEmailHtml(withdrawal.username)},`,
+                paragraphs: [
+                    `<strong>₦${Number(withdrawal.amount).toLocaleString()}</strong> has been paid to your registered bank account.`,
+                    'It may take a short while for your bank tool to show the credit. If anything looks wrong, contact Support in the app.'
+                ]
+            });
+        }
+        return res.json({ success: true, message: 'Withdrawal marked as paid.' });
+    } catch (error) {
+        console.error('Complete withdrawal error:', error.message);
+        return sendApiError(res, error, 'Unable to complete withdrawal.');
+    }
+});
+
 app.get('/api/user/withdrawals', authenticateToken, (req, res) => {
     const username = req.user.username;
     db.all(`SELECT id, amount, wallet_type, status, admin_note, created_at, reviewed_at
@@ -2037,6 +2459,93 @@ app.get('/api/user/:username', authenticateToken, async (req, res) => {
 app.get('/api/payment/manual-info', (req, res) => {
     res.json({ success: true, payment: getManualPaymentInfo() });
 });
+
+// ==========================================
+// WEB PUSH NOTIFICATIONS
+// ==========================================
+// The installed app (PWA + Android TWA) subscribes with the browser Push API
+// and receives: deposit approved, withdrawal paid, plan activated/upgraded and
+// broadcast alerts as { title, body, url } payloads, even while closed.
+
+// The app fetches this before subscribing. Public and additive: when push is
+// not configured the app reads enabled:false and hides its toggle.
+app.get('/api/push/vapid-public-key', (req, res) => {
+    res.json({
+        success: true,
+        enabled: pushService.enabled,
+        publicKey: pushService.publicKey
+    });
+});
+
+function readSubscriptionFromBody(req) {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const sub = body.subscription && typeof body.subscription === 'object' ? body.subscription : body;
+    const endpoint = typeof sub.endpoint === 'string' ? sub.endpoint.trim() : '';
+    const keys = sub.keys && typeof sub.keys === 'object' ? sub.keys : {};
+    const p256dh = typeof keys.p256dh === 'string' ? keys.p256dh.trim() : '';
+    const auth = typeof keys.auth === 'string' ? keys.auth.trim() : '';
+    return { endpoint, p256dh, auth };
+}
+
+function isValidPushEndpoint(endpoint) {
+    if (!endpoint || endpoint.length > 2000) return false;
+    try {
+        const u = new URL(endpoint);
+        if (u.protocol === 'https:') return true;
+        // Plain HTTP is allowed only for localhost dev/test receivers.
+        return u.protocol === 'http:' && ['localhost', '127.0.0.1', '::1'].includes(u.hostname);
+    } catch (_) {
+        return false;
+    }
+}
+
+// Store (upsert by endpoint) the browser's Push API subscription for the
+// signed-in user. Resubscribing the same endpoint refreshes keys in place —
+// browsers rotate them on restart, so upsert must never error.
+app.post('/api/push/subscribe', authenticateToken, actionLimiter, async (req, res) => {
+    if (!pushService.enabled) {
+        return res.status(503).json({ error: 'Push notifications are not enabled on this server.', code: 'PUSH_DISABLED' });
+    }
+    const { endpoint, p256dh, auth } = readSubscriptionFromBody(req);
+    if (!isValidPushEndpoint(endpoint) || !p256dh || !auth || p256dh.length > 512 || auth.length > 512) {
+        return res.status(400).json({ error: 'A valid push subscription with endpoint and keys (p256dh, auth) is required.' });
+    }
+    try {
+        await pushService.saveSubscription({
+            userId: req.user.id,
+            username: req.user.username,
+            endpoint,
+            p256dh,
+            auth,
+            userAgent: req.headers['user-agent']
+        });
+        return res.json({ success: true, message: 'Notifications enabled on this device.' });
+    } catch (error) {
+        console.error('Push subscribe error:', error.message);
+        return res.status(500).json({ error: 'Unable to save notification subscription.' });
+    }
+});
+
+async function handlePushUnsubscribe(req, res) {
+    const { endpoint } = readSubscriptionFromBody(req);
+    const fromQuery = typeof req.query.endpoint === 'string' ? req.query.endpoint.trim() : '';
+    const target = endpoint || fromQuery;
+    if (!target) {
+        return res.status(400).json({ error: 'The subscription endpoint is required.' });
+    }
+    try {
+        const removed = await pushService.removeSubscription(target);
+        return res.json({ success: true, message: removed ? 'Notifications disabled on this device.' : 'That device was not subscribed.', removed });
+    } catch (error) {
+        console.error('Push unsubscribe error:', error.message);
+        return res.status(500).json({ error: 'Unable to remove notification subscription.' });
+    }
+}
+
+// Both spellings stay valid (the app hard-codes these paths).
+app.delete('/api/push/subscribe', authenticateToken, actionLimiter, handlePushUnsubscribe);
+app.delete('/api/push/unsubscribe', authenticateToken, actionLimiter, handlePushUnsubscribe);
+app.post('/api/push/unsubscribe', authenticateToken, actionLimiter, handlePushUnsubscribe);
 
 // Helper to strip heavy receipt data out of JSON list responses.
 function stripReceipt(deposit) {
@@ -2347,6 +2856,21 @@ app.post('/api/admin/approve-deposit', authenticateToken, adminOnly, async (req,
         }
 
         console.warn(`[ADMIN] Deposit ${deposit.id} approved by ${req.user.username}`);
+        // Fire-and-forget: money-critical, pushes immediately even overnight.
+        pushService.notifyUser(
+            deposit.username,
+            'deposit_approved',
+            `₦${Number(deposit.amount).toLocaleString()} has been credited to your wallet.`
+        ).catch((error) => console.warn('[push] deposit_approved send failed:', error.message));
+        sendMailFireAndForget(deposit.username, 'Deposit approved — Access Wealth HQ', {
+            title: 'Your deposit was approved',
+            greeting: `Hi ${escapeEmailHtml(deposit.username)},`,
+            paragraphs: [
+                `<strong>₦${Number(deposit.amount).toLocaleString()}</strong> has been credited to your wallet balance.`,
+                'You can activate or upgrade a package from the Plans page.'
+            ]
+        });
+
         return res.json({ success: true, message: `Deposit of ₦${deposit.amount} approved and credited to ${deposit.username}` });
     } catch (error) {
         console.error('Approve deposit error:', error.message);
@@ -2778,7 +3302,7 @@ app.post('/api/admin/clear-total-balance', authenticateToken, adminOnly, async (
 });
 
 app.get('/api/admin/users', authenticateToken, adminOnly, (req, res) => {
-    db.all(`SELECT id, username, balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance, planActivated, activePackage, activePackageId, role, status, created_at FROM users ORDER BY id DESC`, [], (err, rows) => {
+    db.all(`SELECT id, username, balance, wallet_balance, taskEarnings, daily_earnings, affiliate_balance, planActivated, activePackage, activePackageId, role, COALESCE(NULLIF(TRIM(status), ''), 'active') AS status, created_at FROM users ORDER BY id DESC`, [], (err, rows) => {
         if (err) return res.status(500).json({ error: "Database error" });
         res.json({ success: true, users: rows });
     });
@@ -2953,8 +3477,71 @@ app.get('/api/user/profile/:username', authenticateToken, (req, res) => {
     db.get(`SELECT full_name, phone, bank_name, bank_account_number, bank_account_holder FROM users WHERE LOWER(username) = LOWER(?)`,
         [req.params.username], (err, profile) => {
             if (err) return res.status(500).json({ error: "Database error" });
-            res.json({ success: true, profile: profile || {} });
+            res.json({
+                success: true,
+                profile: profile ? { ...profile, bank_account_number: maskAccountNumber(profile.bank_account_number) } : {}
+            });
         });
+});
+
+// POST /api/user/reveal-bank — the ONLY place the full account number leaves
+// the API. POST (never cached by the app) + Cache-Control: no-store.
+app.post('/api/user/reveal-bank', authenticateToken, actionLimiter, async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    try {
+        const row = await dbGetAsync(
+            `SELECT bank_name, bank_account_number, bank_account_holder FROM users WHERE id = ?`,
+            [req.user.id]
+        );
+        if (!row) return res.status(404).json({ error: 'User not found.' });
+        return res.json({
+            success: true,
+            bank: {
+                bank_name: row.bank_name || '',
+                bank_account_number: row.bank_account_number || '',
+                bank_account_holder: row.bank_account_holder || ''
+            }
+        });
+    } catch (error) {
+        return sendApiError(res, error, 'Unable to reveal bank details.');
+    }
+});
+
+// Email verification (only meaningful for email-style usernames).
+app.post('/api/email/request-verification', authenticateToken, actionLimiter, async (req, res) => {
+    if (!mailer.enabled) {
+        return res.status(503).json({ error: 'Email delivery is not configured on this server.', code: 'MAIL_DISABLED' });
+    }
+    const username = req.user.username;
+    if (!isLikelyEmail(username)) {
+        return res.status(400).json({ error: 'Your username is not an email address, so email verification is unavailable for this account.' });
+    }
+    try {
+        const code = await issueEmailCode(username, 'verify');
+        sendMailFireAndForget(username, 'Verify your Access Wealth email', {
+            title: 'Verify your email',
+            greeting: `Hi ${escapeEmailHtml(username)},`,
+            paragraphs: ['Enter this code in the app to verify your email address. It expires in 15 minutes.'],
+            highlight: code
+        });
+        return res.json({ success: true, message: 'Verification code sent to your email.' });
+    } catch (error) {
+        return sendApiError(res, error, 'Unable to send the verification email.');
+    }
+});
+
+app.post('/api/email/verify', authenticateToken, actionLimiter, async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const code = typeof body.code === 'string' ? body.code.trim() : '';
+    if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Enter the 6-digit code from the email.' });
+    try {
+        const ok = await consumeEmailCode(req.user.username, 'verify', code);
+        if (!ok) return res.status(400).json({ error: 'Invalid or expired verification code.' });
+        await dbRunAsync(`UPDATE users SET email_verified = 'true' WHERE id = ?`, [req.user.id]);
+        return res.json({ success: true, message: 'Email verified.' });
+    } catch (error) {
+        return sendApiError(res, error, 'Unable to verify the email.');
+    }
 });
 
 app.post('/api/user/update-profile', authenticateToken, async (req, res) => {
@@ -2979,10 +3566,21 @@ app.post('/api/user/update-bank', authenticateToken, async (req, res) => {
     try {
         const body = req.body && typeof req.body === 'object' ? req.body : {};
         const bankName = typeof body.bank_name === 'string' ? body.bank_name.trim().slice(0, 120) : '';
-        const accountNumber = typeof body.account_number === 'string' ? body.account_number.trim() : '';
+        let accountNumber = typeof body.account_number === 'string' ? body.account_number.trim() : '';
         const accountHolder = typeof body.account_holder === 'string' ? body.account_holder.trim().slice(0, 120) : '';
-        if (!bankName || !accountNumber || !accountHolder) {
+        if (!bankName || !accountHolder) {
             return res.status(400).json({ error: "All bank fields are required" });
+        }
+        // Clients render the masked number (****8934). Blank or still-masked
+        // means "keep the saved account number" — never overwrite it with the
+        // mask itself.
+        if (!accountNumber || isMaskedAccountNumber(accountNumber)) {
+            const existing = await dbGetAsync(`SELECT bank_account_number FROM users WHERE id = ?`, [req.user.id]);
+            const existingNumber = existing ? String(existing.bank_account_number || '').trim() : '';
+            if (!existingNumber) {
+                return res.status(400).json({ error: "Enter a full account number — there is no saved number to keep." });
+            }
+            accountNumber = existingNumber;
         }
         if (!/^\d{6,20}$/.test(accountNumber)) {
             return res.status(400).json({ error: "Account number must contain 6 to 20 digits" });
@@ -3015,10 +3613,12 @@ app.post('/api/user/change-password', authenticateToken, async (req, res) => {
         if (!valid) return res.status(401).json({ error: "Current password is incorrect" });
         const hashed = await bcryptjs.hash(newPassword, 10);
         await dbRunAsync(
-            `UPDATE users SET password = ? WHERE LOWER(username) = LOWER(?)`,
+            // Changing the password revokes every existing session (bump the
+            // token epoch) — installed apps refresh-fail and sign out too.
+            `UPDATE users SET password = ?, token_epoch = COALESCE(token_epoch, 0) + 1 WHERE LOWER(username) = LOWER(?)`,
             [hashed, req.user.username]
         );
-        return res.json({ success: true, message: "Password changed successfully" });
+        return res.json({ success: true, message: "Password changed successfully. You have been signed out everywhere — please log in again." });
     } catch (error) {
         return sendApiError(res, error, 'Unable to change password.');
     }
@@ -3039,6 +3639,14 @@ app.post('/api/admin/broadcast', authenticateToken, adminOnly, async (req, res) 
             `INSERT INTO broadcasts (title, message, created_by, created_at) VALUES (?, ?, ?, datetime('now'))`,
             [title, message, req.user.username]
         );
+
+        // Broadcasts are NOT money-critical: during Nigeria quiet hours
+        // (23:00–07:00 WAT) the push is queued and delivered at 07:00.
+        const pushBody = message.length > 240 ? `${message.slice(0, 237)}…` : message;
+        pushService.notifyAll(pushBody, { title })
+            .then((r) => { if (r && r.queued) console.warn('[push] broadcast queued for after quiet hours:', r.deliverAt); })
+            .catch((error) => console.warn('[push] broadcast send failed:', error.message));
+
         return res.json({ success: true, message: "Broadcast sent to all users" });
     } catch (error) {
         return sendApiError(res, error, 'Failed to save broadcast.');
@@ -3417,15 +4025,15 @@ async function processActiveInvestmentCycles() {
 // ==========================================
 app.use((err, req, res, next) => {
     if (err && err.type === 'entity.parse.failed') {
-        return res.status(400).json({ error: 'Request body must contain valid JSON.' });
+        return res.status(400).json({ success: false, error: 'Request body must contain valid JSON.' });
     }
     if (err && err.type === 'entity.too.large') {
-        return res.status(413).json({ error: 'Request body is too large.' });
+        return res.status(413).json({ success: false, error: 'Request body is too large.' });
     }
     if (res.headersSent) return next(err);
 
     console.error(`UNHANDLED ERROR:`, err && err.stack ? err.stack : err);
-    return res.status(500).json({ error: "Internal server error" });
+    return res.status(500).json({ success: false, error: "Internal server error" });
 });
 
 process.on('unhandledRejection', (reason) => {
@@ -3461,6 +4069,42 @@ function shutdown(signal) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// Unknown /api/* routes must answer JSON — the installed app parses every API
+// response. Express's default "Cannot GET ..." HTML page would crash the
+// client's parser and is indistinguishable from a maintenance-window HTML page.
+app.use('/api', (req, res) => {
+    res.status(404).json({ success: false, error: 'API endpoint not found.' });
+});
+
+// ==========================================
+// WEB APP (FRONTEND) — served from /public
+// ==========================================
+// The Access Wealth HQ web application is a static single-page app in
+// ./public. Serving it from this same origin means the app calls the API
+// with simple relative URLs ("/api/..."), no CORS round-trips, and one
+// deployable unit. API routes above are registered first, so any unmatched
+// GET below safely falls back to the SPA (client-side routing).
+const PUBLIC_DIR = path.join(__dirname, 'public');
+app.use(express.static(PUBLIC_DIR, {
+    index: 'index.html',
+    maxAge: '1h',
+    setHeaders(res, filePath) {
+        // Never cache the app shell or service worker; code files can cache.
+        if (/index\.html$|manifest\.webmanifest$|sw\.js$/.test(filePath)) {
+            res.setHeader('Cache-Control', 'no-cache');
+        }
+    }
+}));
+
+// SPA fallback: anything that is not an API/health route serves the app shell.
+app.use((req, res, next) => {
+    if (req.method !== 'GET') return next();
+    const p = req.path || '';
+    if (p.startsWith('/api/') || p === '/api' || p === '/health') return next();
+    if (p.includes('.') && !/\.html?$/.test(p)) return next(); // real file, handled above
+    return res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+});
 
 const PORT = process.env.PORT || 3000;
 
@@ -3503,6 +4147,10 @@ function startServer(port = PORT, host = '0.0.0.0') {
         if (process.env.NODE_ENV !== 'test') {
             processActiveInvestmentCycles();
             setInterval(processActiveInvestmentCycles, 60 * 60 * 1000);
+            // Deliver pushes deferred by Nigeria quiet hours (23:00–07:00 WAT).
+            const flushQueue = () => pushService.flushDueQueue().catch((e) => console.warn('[push] queue flush failed:', e.message));
+            setTimeout(flushQueue, 30 * 1000);
+            setInterval(flushQueue, 10 * 60 * 1000);
         }
     });
     return attachServerTimeouts(httpServer);
@@ -3524,5 +4172,6 @@ module.exports = {
     dbRunAsync,
     dbGetAsync,
     resolveActiveEntitlement,
-    serializeUserWithEntitlement
+    serializeUserWithEntitlement,
+    pushService
 };
