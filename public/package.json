@@ -1,0 +1,1 @@
+{ "type": "module", "private": true, "description": "Browser-only ES modules marker for the static Access Wealth HQ app. Not part of the Node server." }

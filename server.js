@@ -1251,7 +1251,9 @@ app.get(['/health', '/api/health'], (req, res) => {
 // return HTML instead. This makes a misconfigured custom domain (frontend and
 // API swapped, or /api not routed to this service) obvious instead of looking
 // like a network error on every login attempt.
-app.get(['/', '/api'], (req, res) => {
+// '/' intentionally falls through to the static app shell (public/index.html);
+// the service-info JSON remains available at '/api' for API consumers.
+app.get('/api', (req, res) => {
     res.json({
         service: 'Access Wealth API',
         status: 'running',
@@ -3461,6 +3463,35 @@ function shutdown(signal) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// ==========================================
+// WEB APP (FRONTEND) — served from /public
+// ==========================================
+// The Access Wealth HQ web application is a static single-page app in
+// ./public. Serving it from this same origin means the app calls the API
+// with simple relative URLs ("/api/..."), no CORS round-trips, and one
+// deployable unit. API routes above are registered first, so any unmatched
+// GET below safely falls back to the SPA (client-side routing).
+const PUBLIC_DIR = path.join(__dirname, 'public');
+app.use(express.static(PUBLIC_DIR, {
+    index: 'index.html',
+    maxAge: '1h',
+    setHeaders(res, filePath) {
+        // Never cache the app shell or service worker; code files can cache.
+        if (/index\.html$|manifest\.webmanifest$|sw\.js$/.test(filePath)) {
+            res.setHeader('Cache-Control', 'no-cache');
+        }
+    }
+}));
+
+// SPA fallback: anything that is not an API/health route serves the app shell.
+app.use((req, res, next) => {
+    if (req.method !== 'GET') return next();
+    const p = req.path || '';
+    if (p.startsWith('/api/') || p === '/api' || p === '/health') return next();
+    if (p.includes('.') && !/\.html?$/.test(p)) return next(); // real file, handled above
+    return res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+});
 
 const PORT = process.env.PORT || 3000;
 

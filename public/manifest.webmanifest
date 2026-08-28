@@ -1,0 +1,25 @@
+{
+    "name": "Access Wealth HQ",
+    "short_name": "AccessWealth",
+    "description": "Access Wealth HQ member portal: packages, daily earnings, deposits, withdrawals, referrals and support.",
+    "start_url": "/#/dashboard",
+    "scope": "/",
+    "display": "standalone",
+    "orientation": "portrait",
+    "background_color": "#0C4A34",
+    "theme_color": "#0C4A34",
+    "icons": [
+        {
+            "src": "/assets/icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "any"
+        },
+        {
+            "src": "/assets/logo.svg",
+            "sizes": "any",
+            "type": "image/svg+xml",
+            "purpose": "any"
+        }
+    ]
+}
