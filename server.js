@@ -136,6 +136,8 @@ const DEFAULT_FRONTEND_ORIGINS = [
     'https://www.accesswealthhq.com',
     'http://localhost:3000',
     'http://127.0.0.1:3000',
+    'http://localhost:4173',
+    'http://127.0.0.1:4173',
     'http://localhost:5500',
     'http://127.0.0.1:5500',
     'http://localhost:5173',
@@ -182,10 +184,30 @@ const configuredFrontendOrigins = (process.env.FRONTEND_URL || '')
     .split(',')
     .map(normalizeOrigin)
     .filter(Boolean);
+// FRONTEND_URL extends the known-good defaults; it must never shrink the
+// allowlist. Setting FRONTEND_URL on a deploy previously *replaced* the
+// defaults, so every forgotten hostname (e.g. the www alias or a dev port)
+// silently lost CORS access. Union keeps configuration additive and safe.
 const allowedOrigins = new Set(
-    (configuredFrontendOrigins.length ? configuredFrontendOrigins : DEFAULT_FRONTEND_ORIGINS)
+    [...DEFAULT_FRONTEND_ORIGINS, ...configuredFrontendOrigins]
         .flatMap(getOriginAliases)
 );
+
+// Deploy-preview hosts: stable, narrowly-scoped shapes for this project only —
+// never a wildcard. Anything else belongs in FRONTEND_URL (exact origin).
+const DEPLOY_PREVIEW_ORIGIN_PATTERNS = [
+    // Arena/e2b sandbox preview proxies, e.g. https://3000-<sandbox-id>.e2b.app
+    /^https:\/\/\d{2,5}-[a-z0-9]+\.e2b\.app$/i,
+    // Railway preview deployments of this service, e.g.
+    // https://access-wealth-backend-pr-12.up.railway.app
+    /^https:\/\/[a-z0-9-]*access-?wealth[a-z0-9-]*\.up\.railway\.app$/i
+];
+
+function isAllowedOrigin(normalizedOrigin) {
+    if (!normalizedOrigin) return false;
+    if (allowedOrigins.has(normalizedOrigin)) return true;
+    return DEPLOY_PREVIEW_ORIGIN_PATTERNS.some((pattern) => pattern.test(normalizedOrigin));
+}
 const allowAnyDevelopmentOrigin = !isProduction &&
     String(process.env.NODE_ENV || '').toLowerCase() === 'development';
 
@@ -196,7 +218,7 @@ app.use(cors({
         if (!origin) return callback(null, true);
 
         const normalizedOrigin = normalizeOrigin(origin);
-        if (allowAnyDevelopmentOrigin || allowedOrigins.has(normalizedOrigin)) {
+        if (allowAnyDevelopmentOrigin || isAllowedOrigin(normalizedOrigin)) {
             return callback(null, true);
         }
 
@@ -207,7 +229,11 @@ app.use(cors({
         console.warn(`Blocked CORS request from ${origin}. Add this origin to FRONTEND_URL if it is the deployed frontend.`);
         return callback(null, false);
     },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    // Everything the PWA/TWA/API client sends. PATCH is required: admin/user
+    // update endpoints accept it, and a missing method in the preflight would
+    // surface to the app as an opaque "Network error" instead of the real
+    // JSON error body.
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true
 }));
