@@ -564,3 +564,77 @@ test('error envelope: 5xx-ready handlers keep shape (sendApiError path)', async 
     const data = await res.json();
     assertErrorShape(data, 404, '404 receipt');
 });
+
+/* ---------------- offline cache policy ---------------- */
+
+function cacheHeader(method, urlPath, token) {
+    return fetch(`${baseUrl}${urlPath}`, { method, headers: token ? { Authorization: `Bearer ${token}` } : {} })
+        .then((res) => ({ status: res.status, cc: (res.headers.get('cache-control') || '').toLowerCase() }));
+}
+
+test('offline-cacheable GETs never carry no-store/no-cache', async () => {
+    // The installed app mirrors these offline; never forbid its own copy.
+    const cacheable = [
+        ['/api/packages', null],
+        ['/api/active-investment', userToken],
+        ['/api/referral/leaderboard', null],
+        [`/api/referral/stats/${encodeURIComponent(USERNAME)}`, userToken],
+        ['/api/broadcasts', userToken],
+        ['/api/broadcasts/all', userToken],
+        ['/api/payment/manual-info', null]
+    ];
+    for (const [path, token] of cacheable) {
+        const { status, cc } = await cacheHeader('GET', path, token);
+        assert.equal(status, 200, `${path} should be 200 for the app`);
+        assert.ok(!/no-store|no-cache/.test(cc), `${path}: must NOT send Cache-Control '${cc}' — the app's offline copy depends on it`);
+    }
+});
+
+test('sensitive GETs carry strict no-store (and POST /user/sync too)', async () => {
+    const noStore = [
+        ['/api/my-deposits', userToken],
+        ['/api/user/withdrawals', userToken],
+        ['/api/user/pending-withdrawal', userToken],
+        [`/api/user/${encodeURIComponent(USERNAME)}`, userToken],
+        [`/api/user/profile/${encodeURIComponent(USERNAME)}`, userToken],
+        [`/api/chat/history/${encodeURIComponent(USERNAME)}`, userToken],
+        ['/api/admin/users', adminToken],
+        ['/api/admin/deposits', adminToken],
+        ['/api/admin/withdrawals', adminToken],
+        ['/api/admin/stats', adminToken],
+        ['/api/support/users', adminToken]
+    ];
+    for (const [path, token] of noStore) {
+        const { status, cc } = await cacheHeader('GET', path, token);
+        assert.equal(status, 200, `${path} should respond 200 (fixture data exists)`);
+        assert.ok(/no-store/.test(cc), `${path}: sensitive payloads MUST be Cache-Control: no-store, got '${cc || 'none'}'`);
+    }
+});
+
+test('auth paths are frozen, exist, and answer JSON', async () => {
+    // The installed app hard-bypasses these from its cache. They must exist at
+    // exactly these paths and always answer JSON (never 404 HTML).
+    const login = await call('POST', '/api/login', { body: { username: USERNAME, password: 'contract456' } });
+    assert.equal(login.status, 200);
+    assertFields(login.data, { ...TOKEN_PAYLOAD, user: 'object' }, 'login (frozen path)');
+
+    const regPath = await call('POST', '/api/register', { body: { username: `reg.path.${Date.now()}@test.com`, password: 'password123' } });
+    assert.equal(regPath.status, 200);
+    assertFields(regPath.data, { ...TOKEN_PAYLOAD, message: 'string', user: 'object' }, 'register (frozen path)');
+
+    const refresh = await call('POST', '/api/refresh-token', { body: { token: userToken } });
+    assert.equal(refresh.status, 200, 'refresh-token path must exist');
+
+    const logout = await call('POST', '/api/logout', { token: userToken });
+    assert.equal(logout.status, 200, 'logout path must exist');
+    assertFields(logout.data, OK_MESSAGE, 'logout');
+
+    // forgot/reset exist at their frozen paths; until a mail/SMS channel is
+    // configured they answer an honest JSON 501 (never 404 HTML).
+    for (const path of ['/api/forgot-password', '/api/reset-password']) {
+        const res = await call('POST', path, { body: path.includes('forgot') ? { username: USERNAME } : { token: 'x', new_password: 'whatever1' } });
+        assert.notEqual(res.status, 404, `${path} must exist`);
+        assert.equal(res.data.success, false, `${path}: JSON error body expected until delivery is configured`);
+        assert.equal(typeof res.data.error, 'string');
+    }
+});

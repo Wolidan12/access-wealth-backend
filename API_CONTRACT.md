@@ -200,6 +200,35 @@ Daily earnings today flow exclusively through `/api/claim-daily-task` +
 `/api/active-investment`. If the app needs spin-win or task lists, add them as
 NEW endpoints (additive) — never by renaming the claim/investment responses.
 
+## Offline caching policy (service-worker contract)
+
+The app's service worker keeps a last-known-good copy of successful GET JSON
+responses, cleared on sign-out. The backend cooperates as follows:
+
+1. **Offline-mirrored reads are never marked no-store/no-cache.**
+   `GET /api/packages`, `/api/active-investment`, `/api/referral/*`,
+   `/api/tasks*` (when added), `/api/broadcasts`, `/api/broadcasts/all`,
+   `/api/payment/manual-info` carry no cache-restricting headers. Pinned by
+   test: *"offline-cacheable GETs never carry no-store/no-cache"*.
+2. **Sensitive payloads carry `Cache-Control: no-store`**: everything under
+   `/api/admin/*` and `/api/support/*`, plus `/api/chat/*`, `/api/user/*`
+   (profile, withdrawals, receipts), `/api/my-deposits`,
+   `/api/sponsored-submission-status/*`. These paths are the app's never-cache
+   list; the two lists must stay in sync.
+3. **Tokens, balances and account identifiers never appear in query strings,**
+   and existing identifier-bearing paths (`/api/user/:username`,
+   `/api/referral/stats/:username`, `/api/chat/history/:username`,
+   `/api/user/profile/:username`, receipt URLs) are frozen — cache keys are
+   full URLs, so shape changes would orphan cached entries.
+4. **Frozen auth paths (the app hard-bypasses them from caching):**
+   `POST /api/login`, `/api/refresh-token`, `/api/register`, `/api/logout`,
+   `/api/forgot-password`, `/api/reset-password`. All exist and always answer
+   JSON. Reset delivery needs a mail/SMS channel that is not configured yet:
+   until then both reset endpoints answer `501`
+   `{ success:false, error, code:'PASSWORD_RESET_UNAVAILABLE' }`. When delivery
+   is added, these paths MUST NOT move.
+
+
 ## Maintenance windows
 
 The API itself never returns HTML. During host maintenance, infrastructure

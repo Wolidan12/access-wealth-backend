@@ -275,6 +275,37 @@ app.use('/api', (req, res, next) => {
 });
 
 // ==========================================
+// CACHE POLICY (offline-app contract)
+// ==========================================
+// The installed app's service worker keeps last-known-good copies of GET JSON
+// responses (cleared on sign-out). Rules encoded here:
+//   (1) read endpoints the app mirrors offline (/api/user/sync, /api/packages,
+//       /api/active-investment, /api/referral/*, /api/tasks*, /api/broadcasts,
+//       /api/payment/manual-info) must stay cacheable — we never send
+//       no-store/no-cache on them;
+//   (2) sensitive payloads (money movements, PII, messages) carry
+//       Cache-Control: no-store — correct HTTP semantics regardless of client;
+//       they also match the app's never-cache list;
+//   (3) tokens/balances never appear in query strings — auth is the
+//       Authorization header only, by design.
+const SENSITIVE_GET_PATTERNS = [
+    /^\/api\/admin(\/|$)/,        // all admin data
+    /^\/api\/support(\/|$)/,       // support inbox listings
+    /^\/api\/chat(\/|$)/,          // private support threads
+    /^\/api\/user(\/|$)/,          // member PII: profile, withdrawals, receipts
+    /^\/api\/my-deposits$/,        // financial history
+    /^\/api\/sponsored-submission-status\// // per-user task/money state
+];
+
+app.use((req, res, next) => {
+    if ((req.method === 'GET' || req.method === 'HEAD')
+        && SENSITIVE_GET_PATTERNS.some((pattern) => pattern.test(req.path))) {
+        res.setHeader('Cache-Control', 'no-store');
+    }
+    next();
+});
+
+// ==========================================
 // MANUAL PAYMENT CONFIGURATION
 // Deposits are handled manually: users transfer to this account and upload a
 // payment receipt for admin approval.
@@ -1569,6 +1600,28 @@ app.post('/api/refresh-token', actionLimiter, (req, res) => {
             finishWithUser(legacyPayload);
         });
     });
+});
+
+// POST /api/logout — JWTs are stateless Bearer tokens: the installed app
+// discards its token and clears its offline cache on sign-out. This endpoint
+// exists so the app's sign-out action has a stable, always-JSON server
+// contract (hard-bypassed from offline caching) and a future hook for a token
+// denylist without moving paths. It always succeeds, with or without a token.
+app.post('/api/logout', actionLimiter, (req, res) => {
+    res.json({ success: true, message: 'Logged out.' });
+});
+
+// POST /api/forgot-password / /api/reset-password — RESERVED, stable paths.
+// The installed app hard-bypasses these from its offline cache, so they must
+// exist and answer JSON forever. Actual delivery needs an email/SMS channel,
+// which is not configured yet; until then we fail honestly with a readable
+// JSON error that routes members to the in-app support chat.
+const PASSWORD_RESET_UNAVAILABLE = 'Password reset is not available yet. Please open Support chat in the app and an agent will verify you and reset your password.';
+app.post('/api/forgot-password', authLimiter, (req, res) => {
+    res.status(501).json({ error: PASSWORD_RESET_UNAVAILABLE, code: 'PASSWORD_RESET_UNAVAILABLE' });
+});
+app.post('/api/reset-password', authLimiter, (req, res) => {
+    res.status(501).json({ error: PASSWORD_RESET_UNAVAILABLE, code: 'PASSWORD_RESET_UNAVAILABLE' });
 });
 
 // ==========================================
